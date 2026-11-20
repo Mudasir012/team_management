@@ -166,6 +166,141 @@ create table if not exists public.task_labels (
   primary key (task_id, label_id)
 );
 
+-- Normalized task collaboration data. The legacy JSONB columns on tasks are
+-- retained for rollback safety but are no longer written to.
+create table if not exists public.task_comments (
+  id uuid primary key default gen_random_uuid(),
+  task_id uuid not null references public.tasks(id) on delete cascade,
+  project_id uuid not null references public.projects(id) on delete cascade,
+  author_id uuid references public.profiles(id) on delete set null,
+  body text not null,
+  reactions jsonb not null default '{}'::jsonb,
+  notify_sent boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.task_subtasks (
+  id uuid primary key default gen_random_uuid(),
+  task_id uuid not null references public.tasks(id) on delete cascade,
+  title text not null,
+  done boolean not null default false,
+  position integer not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.task_attachments (
+  id uuid primary key default gen_random_uuid(),
+  task_id uuid not null references public.tasks(id) on delete cascade,
+  project_id uuid not null references public.projects(id) on delete cascade,
+  name text not null,
+  size text not null default '',
+  type text not null default '',
+  url text,
+  uploaded_by uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists task_comments_task_id_idx on public.task_comments (task_id);
+create index if not exists task_subtasks_task_id_idx on public.task_subtasks (task_id);
+create index if not exists task_attachments_task_id_idx on public.task_attachments (task_id);
+
+-- One-time backfill from the legacy JSONB arrays. Deterministic UUIDs keep this
+-- safe to re-run; on conflict do nothing also avoids duplicating live rows.
+insert into public.task_comments (
+  id, task_id, project_id, author_id, body, reactions, notify_sent, created_at, updated_at
+)
+select
+  case
+    when c.item->>'id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      then (c.item->>'id')::uuid
+    else md5(t.id::text || ':comment:' || c.ord::text)::uuid
+  end,
+  t.id,
+  t.project_id,
+  case
+    when c.item->>'author' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      and exists (select 1 from public.profiles p where p.id = (c.item->>'author')::uuid)
+      then (c.item->>'author')::uuid
+    else null
+  end,
+  coalesce(c.item->>'text', ''),
+  coalesce(c.item->'reactions', '{}'::jsonb),
+  true,
+  t.created_at + (c.ord || ' seconds')::interval,
+  t.created_at + (c.ord || ' seconds')::interval
+from public.tasks t
+cross join lateral jsonb_array_elements(coalesce(t.comments, '[]'::jsonb)) with ordinality as c(item, ord)
+where jsonb_typeof(coalesce(t.comments, '[]'::jsonb)) = 'array'
+on conflict (id) do nothing;
+
+insert into public.task_subtasks (id, task_id, title, done, position)
+select
+  case
+    when s.item->>'id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      then (s.item->>'id')::uuid
+    else md5(t.id::text || ':subtask:' || s.ord::text)::uuid
+  end,
+  t.id,
+  coalesce(s.item->>'title', ''),
+  coalesce((s.item->>'done')::boolean, false),
+  s.ord::integer
+from public.tasks t
+cross join lateral jsonb_array_elements(coalesce(t.subtasks, '[]'::jsonb)) with ordinality as s(item, ord)
+where jsonb_typeof(coalesce(t.subtasks, '[]'::jsonb)) = 'array'
+on conflict (id) do nothing;
+
+insert into public.task_attachments (
+  id, task_id, project_id, name, size, type, url, uploaded_by
+)
+select
+  case
+    when a.item->>'id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      then (a.item->>'id')::uuid
+    else md5(t.id::text || ':attachment:' || a.ord::text)::uuid
+  end,
+  t.id,
+  t.project_id,
+  coalesce(a.item->>'name', ''),
+  coalesce(a.item->>'size', ''),
+  coalesce(a.item->>'type', ''),
+  nullif(a.item->>'url', ''),
+  null
+from public.tasks t
+cross join lateral jsonb_array_elements(coalesce(t.attachments, '[]'::jsonb)) with ordinality as a(item, ord)
+where jsonb_typeof(coalesce(t.attachments, '[]'::jsonb)) = 'array'
+on conflict (id) do nothing;
+
+-- Task assignees must already be project members. OWNER/ADMIN are not exempt:
+-- a project membership is the explicit opt-in that makes assignment coherent.
+create or replace function public.trg_task_assignee_member_check()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_project uuid;
+begin
+  select project_id into v_project from public.tasks where id = NEW.task_id;
+  if v_project is null then
+    raise exception 'Task not found';
+  end if;
+  if not exists (
+    select 1 from public.project_members
+    where project_id = v_project and user_id = NEW.user_id
+  ) then
+    raise exception 'Only project members can be assigned to tasks';
+  end if;
+  return NEW;
+end;
+$$;
+
+drop trigger if exists task_assignees_member_check on public.task_assignees;
+create trigger task_assignees_member_check
+before insert or update of task_id, user_id on public.task_assignees
+for each row execute function public.trg_task_assignee_member_check();
+
 create table if not exists public.milestones (
   id uuid primary key default gen_random_uuid(),
   project_id uuid not null references public.projects(id) on delete cascade,
@@ -436,11 +571,13 @@ stable
 security definer
 set search_path = public, pg_temp
 as $$
-  select public.workspace_role() in ('owner', 'admin')
+  select public.has_permission('team:read') and (
+    public.workspace_role() in ('owner', 'admin')
     or exists (
       select 1 from public.project_members pm
       where pm.project_id = p_project and pm.user_id = auth.uid() and pm.role = 'lead'
-    );
+    )
+  );
 $$;
 
 create or replace function public.can_assign_project_role(
@@ -667,6 +804,10 @@ drop trigger if exists docs_touch on public.project_docs;
 create trigger docs_touch before update on public.project_docs
 for each row execute function public.touch_updated_at();
 
+drop trigger if exists task_comments_touch on public.task_comments;
+create trigger task_comments_touch before update on public.task_comments
+for each row execute function public.touch_updated_at();
+
 -- ---------------------------------------------------------------------------
 -- Workspace status + audit + team RPCs
 -- ---------------------------------------------------------------------------
@@ -778,9 +919,10 @@ create trigger task_assignees_notify
 after insert on public.task_assignees
 for each row execute function public.trg_task_assigned_notify();
 
--- Task comments live in task_comments (created later in this script). This
--- trigger function is created now and wired to its table in the child-table
--- section; it notifies the task creator, assignees, and any @mentioned profile.
+-- Task comments live in task_comments (created earlier in this script). This
+-- AFTER INSERT trigger notifies the task creator, assignees, and any
+-- @mentioned profile once. INSERT ... ON CONFLICT DO UPDATE does not fire
+-- AFTER INSERT for updated rows, so sync rewrites never repeat notifications.
 create or replace function public.trg_task_comment_notify()
 returns trigger
 language plpgsql
@@ -792,6 +934,8 @@ declare
   v_author_name text;
   v_recipient uuid;
 begin
+  if NEW.notify_sent then return null; end if;
+
   select title into v_title from public.tasks where id = NEW.task_id;
   select coalesce(name, 'Someone') into v_author_name
   from public.profiles where id = NEW.author_id;
@@ -819,9 +963,14 @@ begin
       v_author_name || ' commented on ' || coalesce(v_title, 'a task')
     );
   end loop;
+  update public.task_comments set notify_sent = true where id = NEW.id;
   return null;
 end;
 $$;
+
+drop trigger if exists task_comments_notify on public.task_comments;
+create trigger task_comments_notify after insert on public.task_comments
+for each row execute function public.trg_task_comment_notify();
 
 create or replace function public.trg_workspace_role_notify()
 returns trigger
@@ -1152,6 +1301,228 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Conflict-checked task upsert
+-- ---------------------------------------------------------------------------
+create or replace function public.upsert_task_checked(
+  p_task jsonb,
+  p_expected_updated_at timestamptz default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  c_uuid constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  v_task_id uuid := nullif(p_task->>'id', '')::uuid;
+  v_project_id uuid := nullif(p_task->>'projectId', '')::uuid;
+  v_existing public.tasks%rowtype;
+  v_title text := coalesce(nullif(p_task->>'title', ''), 'Untitled');
+  v_label_ids uuid[] := '{}'::uuid[];
+  v_assignee_ids uuid[] := '{}'::uuid[];
+  v_dependency_ids uuid[] := '{}'::uuid[];
+  v_comment_ids uuid[] := '{}'::uuid[];
+  v_subtask_ids uuid[] := '{}'::uuid[];
+  v_attachment_ids uuid[] := '{}'::uuid[];
+begin
+  if v_project_id is null then
+    raise exception 'A task must belong to a project';
+  end if;
+  if v_task_id is null then
+    v_task_id := gen_random_uuid();
+  end if;
+
+  -- Desired IDs are computed before writes so unrelated child rows are not
+  -- reinserted (which would re-fire assignment/comment notifications).
+  select coalesce(array_agg(x.value::uuid), '{}'::uuid[])
+  into v_label_ids
+  from jsonb_array_elements_text(coalesce(p_task->'labels', '[]'::jsonb)) as x(value)
+  where x.value ~* c_uuid;
+
+  select coalesce(array_agg(x.value::uuid), '{}'::uuid[])
+  into v_assignee_ids
+  from jsonb_array_elements_text(coalesce(p_task->'assignees', '[]'::jsonb)) as x(value)
+  where x.value ~* c_uuid;
+
+  select coalesce(array_agg(x.value::uuid), '{}'::uuid[])
+  into v_dependency_ids
+  from jsonb_array_elements_text(coalesce(p_task->'dependencies', '[]'::jsonb)) as x(value)
+  where x.value ~* c_uuid;
+
+  select * into v_existing from public.tasks where id = v_task_id;
+
+  if found then
+    if not public.can_write_task(v_task_id) then
+      raise exception 'You cannot edit this task';
+    end if;
+    if p_expected_updated_at is not null and v_existing.updated_at <> p_expected_updated_at then
+      raise exception using
+        errcode = '40001',
+        message = 'This task changed on the server',
+        detail = 'Reload before saving your changes.';
+    end if;
+
+    update public.tasks
+    set
+      title = v_title,
+      description = coalesce(p_task->>'description', ''),
+      status = coalesce(nullif(p_task->>'status', ''), status),
+      priority = coalesce(nullif(p_task->>'priority', ''), priority),
+      due_date = nullif(p_task->>'due', '')::date,
+      recurring = nullif(p_task->>'recurring', ''),
+      estimate = nullif(p_task->>'estimate', '')::numeric,
+      spent = coalesce(nullif(p_task->>'spent', '')::numeric, 0),
+      checklist = coalesce(p_task->'checklist', '[]'::jsonb),
+      dependencies = v_dependency_ids,
+      subtasks = '[]'::jsonb,
+      attachments = '[]'::jsonb,
+      comments = '[]'::jsonb
+    where id = v_task_id;
+  else
+    if not public.can_create_task(v_project_id) then
+      raise exception 'You cannot create tasks in this project';
+    end if;
+
+    insert into public.tasks (
+      id, project_id, title, description, status, priority, due_date, recurring,
+      estimate, spent, checklist, dependencies, subtasks, attachments, comments, created_by
+    )
+    values (
+      v_task_id, v_project_id, v_title, coalesce(p_task->>'description', ''),
+      coalesce(nullif(p_task->>'status', ''), 'todo'),
+      coalesce(nullif(p_task->>'priority', ''), 'Medium'),
+      nullif(p_task->>'due', '')::date,
+      nullif(p_task->>'recurring', ''),
+      nullif(p_task->>'estimate', '')::numeric,
+      coalesce(nullif(p_task->>'spent', '')::numeric, 0),
+      coalesce(p_task->'checklist', '[]'::jsonb),
+      v_dependency_ids, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, auth.uid()
+    );
+  end if;
+
+  -- IDs for the remaining children use deterministic fallbacks for legacy
+  -- non-UUID ids so re-running the payload never creates duplicates.
+  select coalesce(array_agg(
+    case
+      when c.item->>'id' ~* c_uuid then (c.item->>'id')::uuid
+      else md5(v_task_id::text || ':comment:' || c.ord::text)::uuid
+    end
+  ), '{}'::uuid[])
+  into v_comment_ids
+  from jsonb_array_elements(coalesce(p_task->'comments', '[]'::jsonb)) with ordinality as c(item, ord);
+
+  select coalesce(array_agg(
+    case
+      when s.item->>'id' ~* c_uuid then (s.item->>'id')::uuid
+      else md5(v_task_id::text || ':subtask:' || s.ord::text)::uuid
+    end
+  ), '{}'::uuid[])
+  into v_subtask_ids
+  from jsonb_array_elements(coalesce(p_task->'subtasks', '[]'::jsonb)) with ordinality as s(item, ord);
+
+  select coalesce(array_agg(
+    case
+      when a.item->>'id' ~* c_uuid then (a.item->>'id')::uuid
+      else md5(v_task_id::text || ':attachment:' || a.ord::text)::uuid
+    end
+  ), '{}'::uuid[])
+  into v_attachment_ids
+  from jsonb_array_elements(coalesce(p_task->'attachments', '[]'::jsonb)) with ordinality as a(item, ord);
+
+  delete from public.task_labels
+  where task_id = v_task_id and not (label_id = any(v_label_ids));
+  insert into public.task_labels (task_id, label_id)
+  select v_task_id, x from unnest(v_label_ids) as x
+  on conflict do nothing;
+
+  delete from public.task_assignees
+  where task_id = v_task_id and not (user_id = any(v_assignee_ids));
+  insert into public.task_assignees (task_id, user_id)
+  select v_task_id, x from unnest(v_assignee_ids) as x
+  on conflict do nothing;
+
+  delete from public.task_comments
+  where task_id = v_task_id and not (id = any(v_comment_ids));
+  insert into public.task_comments (
+    id, task_id, project_id, author_id, body, reactions, notify_sent, created_at, updated_at
+  )
+  select
+    case
+      when c.item->>'id' ~* c_uuid then (c.item->>'id')::uuid
+      else md5(v_task_id::text || ':comment:' || c.ord::text)::uuid
+    end,
+    v_task_id,
+    v_project_id,
+    case
+      when c.item->>'author' ~* c_uuid
+        and exists (select 1 from public.profiles p where p.id = (c.item->>'author')::uuid)
+        then (c.item->>'author')::uuid
+      else null
+    end,
+    coalesce(c.item->>'text', ''),
+    coalesce(c.item->'reactions', '{}'::jsonb),
+    false,
+    now(),
+    now()
+  from jsonb_array_elements(coalesce(p_task->'comments', '[]'::jsonb)) with ordinality as c(item, ord)
+  on conflict (id) do update
+    set body = excluded.body,
+        reactions = excluded.reactions,
+        updated_at = now();
+
+  delete from public.task_subtasks
+  where task_id = v_task_id and not (id = any(v_subtask_ids));
+  insert into public.task_subtasks (id, task_id, title, done, position)
+  select
+    case
+      when s.item->>'id' ~* c_uuid then (s.item->>'id')::uuid
+      else md5(v_task_id::text || ':subtask:' || s.ord::text)::uuid
+    end,
+    v_task_id,
+    coalesce(s.item->>'title', ''),
+    coalesce((s.item->>'done')::boolean, false),
+    s.ord::integer
+  from jsonb_array_elements(coalesce(p_task->'subtasks', '[]'::jsonb)) with ordinality as s(item, ord)
+  on conflict (id) do update
+    set title = excluded.title,
+        done = excluded.done,
+        position = excluded.position;
+
+  delete from public.task_attachments
+  where task_id = v_task_id and not (id = any(v_attachment_ids));
+  insert into public.task_attachments (
+    id, task_id, project_id, name, size, type, url, uploaded_by
+  )
+  select
+    case
+      when a.item->>'id' ~* c_uuid then (a.item->>'id')::uuid
+      else md5(v_task_id::text || ':attachment:' || a.ord::text)::uuid
+    end,
+    v_task_id,
+    v_project_id,
+    coalesce(a.item->>'name', ''),
+    coalesce(a.item->>'size', ''),
+    coalesce(a.item->>'type', ''),
+    nullif(a.item->>'url', ''),
+    case
+      when a.item->>'owner' ~* c_uuid
+        and exists (select 1 from public.profiles p where p.id = (a.item->>'owner')::uuid)
+        then (a.item->>'owner')::uuid
+      else null
+    end
+  from jsonb_array_elements(coalesce(p_task->'attachments', '[]'::jsonb)) with ordinality as a(item, ord)
+  on conflict (id) do update
+    set name = excluded.name,
+        size = excluded.size,
+        type = excluded.type,
+        url = excluded.url;
+
+  perform public.log_audit('saved task ' || v_title);
+  return (select public.task_json(t) from public.tasks t where t.id = v_task_id);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- JSON builders + workspace loader
 -- ---------------------------------------------------------------------------
 create or replace function public.member_json(p public.profiles)
@@ -1190,10 +1561,29 @@ as $$
     'recurring', t.recurring,
     'estimate', t.estimate,
     'spent', t.spent,
-    'subtasks', coalesce(t.subtasks, '[]'::jsonb),
+    'updatedAt', t.updated_at,
+    'subtasks', coalesce((
+      select jsonb_agg(jsonb_build_object('id', s.id, 'title', s.title, 'done', s.done)
+                       order by s.position, s.created_at)
+      from public.task_subtasks s where s.task_id = t.id
+    ), '[]'::jsonb),
+    -- checklist is still stored on tasks; it is a private per-user checklist,
+    -- not shared collaboration data like the three tables above.
     'checklist', coalesce(t.checklist, '[]'::jsonb),
-    'attachments', coalesce(t.attachments, '[]'::jsonb),
-    'comments', coalesce(t.comments, '[]'::jsonb),
+    'attachments', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id', a.id, 'name', a.name, 'size', a.size, 'owner', a.uploaded_by,
+        'type', a.type, 'url', a.url
+      ) order by a.created_at)
+      from public.task_attachments a where a.task_id = t.id
+    ), '[]'::jsonb),
+    'comments', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id', c.id, 'author', c.author_id, 'text', c.body,
+        'time', to_char(c.created_at, 'HH24:MI'), 'reactions', c.reactions
+      ) order by c.created_at)
+      from public.task_comments c where c.task_id = t.id
+    ), '[]'::jsonb),
     'dependencies', to_jsonb(coalesce(t.dependencies, '{}'::uuid[])),
     'labels', coalesce((
       select jsonb_agg(tl.label_id) from public.task_labels tl where tl.task_id = t.id
@@ -1221,11 +1611,15 @@ as $$
     'description', p.description,
     'sprint', p.sprint,
     'preview', p.preview,
+    'visibility', p.visibility,
     'customFields', coalesce(p.custom_fields, '{}'::jsonb),
     'customStatuses', to_jsonb(coalesce(p.custom_statuses, '{}'::text[])),
     'members', coalesce((
       select jsonb_agg(pm.user_id) from public.project_members pm where pm.project_id = p.id
     ), '[]'::jsonb),
+    'memberRoles', coalesce((
+      select jsonb_object_agg(pm.user_id::text, pm.role) from public.project_members pm where pm.project_id = p.id
+    ), '{}'::jsonb),
     'labels', coalesce((
       select jsonb_agg(pl.label_id) from public.project_labels pl where pl.project_id = p.id
     ), '[]'::jsonb),
@@ -1278,6 +1672,23 @@ as $$
       select jsonb_agg(public.member_json(m) order by m.created_at)
       from public.profiles m
       where not m.disabled
+    ), '[]'::jsonb),
+    'teams', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id', tm.id, 'name', tm.name,
+        'members', coalesce((
+          select jsonb_agg(tm2.user_id) from public.team_members tm2 where tm2.team_id = tm.id
+        ), '[]'::jsonb)
+      ) order by tm.name)
+      from public.teams tm
+    ), '[]'::jsonb),
+    'workspaceInvites', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id', i.id, 'email', i.email, 'name', i.name, 'role', i.role,
+        'projectIds', to_jsonb(i.project_ids), 'projectRole', i.project_role,
+        'expiresAt', i.expires_at, 'acceptedAt', i.accepted_at
+      ) order by i.created_at desc)
+      from public.workspace_invites i
     ), '[]'::jsonb),
     'labels', coalesce((
       select jsonb_agg(jsonb_build_object('id', l.id, 'name', l.name, 'color', l.color) order by l.name)
@@ -1374,6 +1785,9 @@ alter table public.project_labels enable row level security;
 alter table public.tasks enable row level security;
 alter table public.task_assignees enable row level security;
 alter table public.task_labels enable row level security;
+alter table public.task_comments enable row level security;
+alter table public.task_subtasks enable row level security;
+alter table public.task_attachments enable row level security;
 alter table public.milestones enable row level security;
 alter table public.project_docs enable row level security;
 alter table public.project_files enable row level security;
@@ -1543,8 +1957,39 @@ for select to authenticated using (public.can_view_task(task_id));
 drop policy if exists task_labels_write on public.task_labels;
 create policy task_labels_write on public.task_labels
 for all to authenticated
-using (public.has_permission('tasks:write'))
-with check (public.has_permission('tasks:write'));
+using (public.can_write_task(task_id))
+with check (public.can_write_task(task_id));
+
+-- normalized task children
+drop policy if exists task_comments_select on public.task_comments;
+create policy task_comments_select on public.task_comments
+for select to authenticated using (public.can_view_task(task_id));
+
+drop policy if exists task_comments_write on public.task_comments;
+create policy task_comments_write on public.task_comments
+for all to authenticated
+using (public.can_write_task(task_id))
+with check (public.can_write_task(task_id));
+
+drop policy if exists task_subtasks_select on public.task_subtasks;
+create policy task_subtasks_select on public.task_subtasks
+for select to authenticated using (public.can_view_task(task_id));
+
+drop policy if exists task_subtasks_write on public.task_subtasks;
+create policy task_subtasks_write on public.task_subtasks
+for all to authenticated
+using (public.can_write_task(task_id))
+with check (public.can_write_task(task_id));
+
+drop policy if exists task_attachments_select on public.task_attachments;
+create policy task_attachments_select on public.task_attachments
+for select to authenticated using (public.can_view_task(task_id));
+
+drop policy if exists task_attachments_write on public.task_attachments;
+create policy task_attachments_write on public.task_attachments
+for all to authenticated
+using (public.can_write_task(task_id))
+with check (public.can_write_task(task_id));
 
 -- project children
 drop policy if exists milestones_select on public.milestones;
@@ -1758,6 +2203,7 @@ revoke execute on function public.add_project_member(uuid, uuid, public.project_
 revoke execute on function public.set_project_member_role(uuid, uuid, public.project_role) from public, anon;
 revoke execute on function public.remove_project_member(uuid, uuid) from public, anon;
 revoke execute on function public.add_team_to_project(uuid, uuid, public.project_role) from public, anon;
+revoke execute on function public.upsert_task_checked(jsonb, timestamptz) from public, anon;
 revoke execute on function public.log_audit(text) from public, anon;
 revoke execute on function public.notify_user(uuid, text) from public, anon, authenticated;
 revoke execute on function public.handle_new_user() from public, anon, authenticated;
@@ -1765,6 +2211,7 @@ revoke execute on function public.protect_profile() from public, anon, authentic
 revoke execute on function public.trg_project_member_notify() from public, anon, authenticated;
 revoke execute on function public.trg_task_assigned_notify() from public, anon, authenticated;
 revoke execute on function public.trg_task_comment_notify() from public, anon, authenticated;
+revoke execute on function public.trg_task_assignee_member_check() from public, anon, authenticated;
 revoke execute on function public.trg_workspace_role_notify() from public, anon, authenticated;
 
 grant execute on function public.workspace_status() to anon, authenticated;
@@ -1776,6 +2223,7 @@ grant execute on function public.add_project_member(uuid, uuid, public.project_r
 grant execute on function public.set_project_member_role(uuid, uuid, public.project_role) to authenticated;
 grant execute on function public.remove_project_member(uuid, uuid) to authenticated;
 grant execute on function public.add_team_to_project(uuid, uuid, public.project_role) to authenticated;
+grant execute on function public.upsert_task_checked(jsonb, timestamptz) to authenticated;
 grant execute on function public.log_audit(text) to authenticated;
 
 -- Keep the workspace label empty by default; no demo rows.
