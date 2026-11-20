@@ -5,9 +5,9 @@ import {
   MoreHorizontal, Trash2, Send, FileText, Sparkles, ChevronDown, ChevronRight, Upload,
   ThumbsUp, AtSign, Timer, Calendar
 } from "lucide-react";
+import { useAuth } from "../auth";
 import { useStore } from "../store";
-import { uid } from "../data/seed";
-import { cx, fmtDate, initials, daysRemaining } from "../utils";
+import { cx, fmtDate, initials, daysRemaining, uid } from "../utils";
 
 export const VIEW_TABS = [
   { id: "list", label: "List", icon: List },
@@ -139,6 +139,7 @@ function PriorityMark({ priority }) {
 
 export function TaskList({ tasks, projects, group = "none", onOpen, selected, setSelected, onBulk, compact }) {
   const { state } = useStore();
+  const { user } = useAuth();
   const [groupCollapsed, setGroupCollapsed] = useState({});
 
   function groups() {
@@ -166,7 +167,7 @@ export function TaskList({ tasks, projects, group = "none", onOpen, selected, se
             <option value="">Move to…</option>{statusesFor({ customStatuses: ["Backlog", "Todo", "In Progress", "Review", "Done"] }).map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
           </select>
           <button className="btn sm" onClick={() => onBulk("priority", "High")}>Set high priority</button>
-          <button className="btn sm" onClick={() => onBulk("assign", "u1")}>Assign to me</button>
+          <button className="btn sm" onClick={() => onBulk("assign", user.id)}>Assign to me</button>
           <button className="btn sm danger" onClick={() => onBulk("delete")}><Trash2 size={14} /> Delete</button>
           <button className="btn sm ghost" onClick={() => setSelected([])}><X size={14} /></button>
         </div>
@@ -422,6 +423,7 @@ export function AddTaskModal({ onClose, projects, defaultProjectId, defaultStatu
 
 export function TaskDetailModal({ task, project, projects, onClose }) {
   const { state, dispatch } = useStore();
+  const { user } = useAuth();
   const [comment, setComment] = useState("");
   const [mentionOpen, setMentionOpen] = useState(false);
   const [local, setLocal] = useState(task);
@@ -439,7 +441,7 @@ export function TaskDetailModal({ task, project, projects, onClose }) {
 
   function addComment() {
     if (!comment.trim()) return;
-    set("comments", [...(local.comments || []), { id: uid("cm"), author: "u1", text: comment.trim(), time: "Just now", reactions: {} }]);
+    set("comments", [...(local.comments || []), { id: uid("cm"), author: user.id, text: comment.trim(), time: "Just now", reactions: {} }]);
     setComment(""); setMentionOpen(false);
   }
 
@@ -534,7 +536,7 @@ export function TaskDetailModal({ task, project, projects, onClose }) {
             <label className="lbl">Priority<select className="field" value={local.priority} onChange={e => set("priority", e.target.value)}>{PRIORITIES.map(p => <option key={p}>{p}</option>)}</select></label>
             <label className="lbl">Due date<input className="field" type="date" value={local.due || ""} onChange={e => set("due", e.target.value)} /></label>
             <label className="lbl">Estimate (h)<input className="field" type="number" value={local.estimate} onChange={e => set("estimate", e.target.value)} /></label>
-            <label className="lbl">Time spent (h)<input className="field" type="number" value={local.spent} onChange={e => set("spent", e.target.value)} /><button className="btn sm" style={{ marginTop: 6 }} onClick={() => { set("spent", Number(local.spent) + .5); dispatch({ type: "ADD_TIME_ENTRY", entry: { id: uid("te"), member: "u1", project: local.projectId, task: local.title, hours: .5, date: new Date().toISOString().slice(0, 10) } }); }}><Timer size={14} /> Log 30 min</button></label>
+            <label className="lbl">Time spent (h)<input className="field" type="number" value={local.spent} onChange={e => set("spent", e.target.value)} /><button className="btn sm" style={{ marginTop: 6 }} onClick={() => { set("spent", Number(local.spent) + .5); dispatch({ type: "ADD_TIME_ENTRY", entry: { id: uid("te"), member: user.id, project: local.projectId, task: local.title, hours: .5, date: new Date().toISOString().slice(0, 10) } }); }}><Timer size={14} /> Log 30 min</button></label>
             <div className="lbl">Assignees<div className="row" style={{ flexWrap: "wrap" }}>{state.members.map(m => <button key={m.id} className={cx("assign-chip", local.assignees.includes(m.id) && "on")} onClick={() => set("assignees", local.assignees.includes(m.id) ? local.assignees.filter(x => x !== m.id) : [...local.assignees, m.id])} title={m.name}><span className="avatar mini" style={{ background: m.color }}>{initials(m.name)}</span></button>)}</div></div>
             <div className="lbl">Labels<div className="row" style={{ flexWrap: "wrap" }}>{state.labels.map(l => <button key={l.id} className="chip" style={local.labels.includes(l.id) ? { borderColor: l.color, color: l.color } : {}} onClick={() => set("labels", local.labels.includes(l.id) ? local.labels.filter(x => x !== l.id) : [...local.labels, l.id])}><span className="label-dot" style={{ background: l.color, width: 8, height: 8 }} />{l.name}</button>)}</div></div>
             {Object.entries(project?.customFields || {}).length > 0 && <div className="lbl">Custom fields{Object.entries(project.customFields).map(([k, v]) => <div key={k} className="space-between small custom-field"><span>{k}</span><b>{v}</b></div>)}</div>}

@@ -1,7 +1,6 @@
 ﻿import { useState } from "react";
 import { useStore } from "../store";
-import { money } from "../utils";
-import { uid } from "../data/seed";
+import { money, uid } from "../utils";
 
 const TODAY = new Date().toISOString().slice(0, 10);
 

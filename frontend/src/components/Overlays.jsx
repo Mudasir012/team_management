@@ -1,8 +1,9 @@
 ﻿import { useMemo, useState } from "react";
 import { X, Search } from "lucide-react";
+import { useAuth } from "../auth";
 import { useStore } from "../store";
-import { uid } from "../data/seed";
-import { money, daysLabel, progressFromTasks } from "../utils";
+import { markAllNotificationsRead, markNotificationRead, savePreferences } from "../sync";
+import { money, daysLabel, progressFromTasks, uid } from "../utils";
 
 export function Modal({ title, subtitle, children, onClose, wide }) {
   return (
@@ -23,10 +24,11 @@ export function Modal({ title, subtitle, children, onClose, wide }) {
 
 export function ProjectModal({ onClose, existing }) {
   const { state, dispatch } = useStore();
+  const { user } = useAuth();
   const [form, setForm] = useState(existing || {
     id: uid("p"), name: "", status: "To Do", start: new Date().toISOString().slice(0,10),
     end: new Date(Date.now()+14*86400000).toISOString().slice(0,10), budget: 5000,
-    members: ["u1"], labels: [], customerId: state.customers[0]?.id || "", progress: 0,
+    members: [user.id], labels: [], customerId: state.customers[0]?.id || "", progress: 0,
     preview: "stats", description: "", milestones: [], sprint: "Backlog", docs: [], chat: [], files: [], activity: [],
     customFields: {}, customStatuses: ["Backlog","Todo","In Progress","Review","Done"], tasks: [],
   });
@@ -96,21 +98,25 @@ export function LabelModal({ initial, onClose }) {
 
 export function CommandPalette({ onClose, onAddProject }) {
   const { state, dispatch } = useStore();
+  const { hasPermission } = useAuth();
   const [q, setQ] = useState("");
-  const pages = [
-    ["dashboard","Dashboard"],["analytics","Analytics"],["customer","Customer"],["todo","To Do List"],["project","Project"],["leads","Leads"],["earning","Earning"],["expenses","Expenses"]
-  ];
   const items = useMemo(() => {
     const term = q.toLowerCase();
+    const pages = [
+      ["dashboard","Dashboard"],["analytics","Analytics"],["customer","Customer"],["todo","To Do List"],["project","Project"],["leads","Leads"],["earning","Earning"],["expenses","Expenses"]
+    ].filter(([id]) => hasPermission({
+      dashboard: "projects:read", analytics: "analytics:read", customer: "customers:read", todo: "tasks:read",
+      project: "projects:read", leads: "leads:read", earning: "invoices:read", expenses: "expenses:read",
+    }[id]));
     const list = [
       ...pages.map(([id,label])=>({type:"page", id, label:`Go to ${label}`, action:()=>{dispatch({type:"SET_PAGE",page:id}); onClose();}})),
-      {type:"action", id:"new", label:"Create new project", action:()=>{onClose(); onAddProject();}},
-      ...state.projects.map(p=>({type:"project", id:p.id, label:`Open project: ${p.name}`, meta: daysLabel(p.end,p.status), action:()=>{dispatch({type:"SELECT_PROJECT",id:p.id}); dispatch({type:"SET_PAGE",page:"projectDetail"}); onClose();}})),
-      ...state.customers.map(c=>({type:"customer", id:c.id, label:`Customer: ${c.name}`, meta:c.status, action:()=>{dispatch({type:"SET_PAGE",page:"customer"}); onClose();}})),
+      ...(hasPermission("projects:write") ? [{type:"action", id:"new", label:"Create new project", action:()=>{onClose(); onAddProject();}}] : []),
+      ...(hasPermission("projects:read") ? state.projects.map(p=>({type:"project", id:p.id, label:`Open project: ${p.name}`, meta: daysLabel(p.end,p.status), action:()=>{dispatch({type:"SELECT_PROJECT",id:p.id}); dispatch({type:"SET_PAGE",page:"projectDetail"}); onClose();}})) : []),
+      ...(hasPermission("customers:read") ? state.customers.map(c=>({type:"customer", id:c.id, label:`Customer: ${c.name}`, meta:c.status, action:()=>{dispatch({type:"SET_PAGE",page:"customer"}); onClose();}})) : []),
     ];
     if (!term) return list.slice(0,12);
     return list.filter(i => i.label.toLowerCase().includes(term)).slice(0,12);
-  }, [q, state.projects, state.customers]);
+  }, [q, state.projects, state.customers, hasPermission, dispatch, onClose, onAddProject]);
 
   return (
     <div className="palette-backdrop" onMouseDown={(e)=>e.target===e.currentTarget && onClose()}>
@@ -131,23 +137,53 @@ export function CommandPalette({ onClose, onAddProject }) {
 
 export function NotificationsDrawer({ onClose }) {
   const { state, dispatch } = useStore();
+  const { user } = useAuth();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function markAll() {
+    setBusy(true); setError("");
+    try {
+      await markAllNotificationsRead(user.id);
+      dispatch({ type: "MARK_ALL_READ" });
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
+  }
+
+  async function markRead(notification) {
+    setError("");
+    try {
+      await markNotificationRead(notification.id);
+      dispatch({ type: "MARK_NOTIFICATION_READ", id: notification.id });
+    } catch (e) { setError(e.message); }
+  }
+
+  async function togglePreference(key, value) {
+    setError("");
+    try {
+      await savePreferences(user.id, { ...state.notificationsPrefs, [key]: value });
+      dispatch({ type: "SET_PREFS", prefs: { [key]: value } });
+    } catch (e) { setError(e.message); }
+  }
+
   return (
     <div className="drawer">
-      <div className="drawer-head"><div><h3 style={{margin:0}}>Notifications</h3><div className="small">In-app · email · push preferences (demo)</div></div><div className="row"><button className="btn sm" onClick={()=>dispatch({type:"MARK_ALL_READ"})}>Mark all read</button><button className="icon-btn" onClick={onClose}><X size={18}/></button></div></div>
+      <div className="drawer-head"><div><h3 style={{margin:0}}>Notifications</h3><div className="small">In-app · email · push preferences</div></div><div className="row"><button className="btn sm" disabled={busy || !state.notifications.some(n => !n.read)} onClick={markAll}>Mark all read</button><button className="icon-btn" onClick={onClose}><X size={18}/></button></div></div>
       <div className="drawer-body stack">
+        {error && <div className="glass-error">{error}</div>}
         <div className="panel stack">
           <strong style={{fontSize:14}}>Preferences</strong>
           {Object.entries(state.notificationsPrefs).map(([k,v])=>(
-            <label key={k} className="row" style={{justifyContent:"space-between"}}><span style={{textTransform:"capitalize"}}>{k.replace(/([A-Z])/g," $1")}</span><input type="checkbox" checked={v} onChange={e=>dispatch({type:"SET_PREFS", prefs:{[k]:e.target.checked}})} /></label>
+            <label key={k} className="row" style={{justifyContent:"space-between"}}><span style={{textTransform:"capitalize"}}>{k.replace(/([A-Z])/g," $1")}</span><input type="checkbox" checked={v} onChange={e=>togglePreference(k, e.target.checked)} /></label>
           ))}
         </div>
         <div className="list">
           {state.notifications.map(n=>(
             <div key={n.id} className="list-row" style={{opacity:n.read?0.7:1}}>
-              <div><div style={{fontWeight:600,fontSize:14}}>{n.text}</div><div className="small">{n.time} · {n.type}</div></div>
-              {!n.read && <button className="btn sm" onClick={()=>dispatch({type:"MARK_NOTIFICATION_READ", id:n.id})}>Read</button>}
+              <div><div style={{fontWeight:600,fontSize:14}}>{n.text}</div><div className="small">{n.time ? new Date(n.time).toLocaleString() : ""}</div></div>
+              {!n.read && <button className="btn sm" onClick={()=>markRead(n)}>Read</button>}
             </div>
           ))}
+          {!state.notifications.length && <div className="empty">No notifications yet.</div>}
         </div>
       </div>
     </div>
@@ -167,7 +203,7 @@ export function AiDrawer({ onClose }) {
     : `Task summary (local): ${allTasks.length} total tasks · ${allTasks.filter(t=>t.status==="done").length} done · ${Math.round((allTasks.filter(t=>t.status==="done").length/Math.max(1,allTasks.length))*100)}% complete. Top priority: keep ${state.projects.find(p=>p.status!=="Completed")?.name || "active projects"} on track.`;
   return (
     <div className="drawer">
-      <div className="drawer-head"><div><h3 style={{margin:0}}>AI Assistant</h3><div className="small">Local demo summaries (no external API)</div></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div>
+      <div className="drawer-head"><div><h3 style={{margin:0}}>AI Assistant</h3><div className="small">Local summaries (no external API)</div></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div>
       <div className="drawer-body stack">
         <div className="row" style={{flexWrap:"wrap"}}>
           <button className={"tab "+(mode==="standup"?"active":"")} onClick={()=>setMode("standup")}>Standup summary</button>

@@ -1,17 +1,18 @@
 ﻿import { useState } from "react";
+import { useAuth } from "../auth";
 import { useStore } from "../store";
-import { money } from "../utils";
-import { uid } from "../data/seed";
+import { money, uid } from "../utils";
 
 const stages = ["New","Qualified","Proposal","Negotiation","Won","Lost"];
 
 export default function LeadsPage() {
   const { state, dispatch } = useStore();
+  const { user } = useAuth();
   const [q, setQ] = useState("");
-  const [draft, setDraft] = useState({ company:"", contact:"", value:5000, stage:"New", owner:"u1", source:"Inbound" });
+  const [draft, setDraft] = useState({ company:"", contact:"", value:5000, stage:"New", owner:user.id, source:"Inbound" });
   const [dragId, setDragId] = useState(null);
   const filtered = state.leads.filter(l => (l.company+l.contact+l.source).toLowerCase().includes(q.toLowerCase()));
-  function add(e){ e.preventDefault(); if(!draft.company) return; dispatch({type:"ADD_LEAD", lead:{id:uid("ld"), ...draft, value:Number(draft.value)||0}}); setDraft({company:"",contact:"",value:5000,stage:"New",owner:"u1",source:"Inbound"}); }
+  function add(e){ e.preventDefault(); if(!draft.company) return; dispatch({type:"ADD_LEAD", lead:{id:uid("ld"), ...draft, value:Number(draft.value)||0}}); setDraft({company:"",contact:"",value:5000,stage:"New",owner:user.id,source:"Inbound"}); }
   function move(id, stage){ const lead = state.leads.find(l=>l.id===id); if(lead) dispatch({type:"UPDATE_LEAD", lead:{...lead, stage}}); }
   return (
     <div className="stack page-leads">
@@ -21,7 +22,7 @@ export default function LeadsPage() {
           <input className="field" placeholder="Company" value={draft.company} onChange={e=>setDraft({...draft,company:e.target.value})} required />
           <input className="field" placeholder="Contact" value={draft.contact} onChange={e=>setDraft({...draft,contact:e.target.value})} />
           <input className="field" type="number" placeholder="Value" value={draft.value} onChange={e=>setDraft({...draft,value:e.target.value})} />
-          <select className="field" value={draft.owner} onChange={e=>setDraft({...draft,owner:e.target.value})}>{state.members.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}</select>
+          <select className="field" value={draft.owner} onChange={e=>setDraft({...draft,owner:e.target.value})}>{state.members.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}{!state.members.length && <option value={user.id}>{user.name}</option>}</select>
           <button className="btn primary sm" type="submit">Add lead</button>
           <input className="field" placeholder="Search pipeline…" value={q} onChange={e=>setQ(e.target.value)} style={{marginLeft:"auto"}} />
         </form>

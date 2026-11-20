@@ -1,16 +1,50 @@
-# React + Vite
+# Team Management
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A React + Vite workspace app backed by Supabase Auth and Postgres. There is no custom
+API server or seed/demo data — roles and permissions live in Postgres and are enforced
+with row-level security.
 
-Currently, two official plugins are available:
+## Layout
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- `frontend/` – Vite + React client
+- `supabase/schema.sql` – tables, triggers, roles, RLS policies and the workspace loader
+- `.env.example` – environment variables
 
-## React Compiler
+## Scripts
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- `npm run dev` – start the Vite dev server
+- `npm run build` – build to `frontend/dist`
+- `npm run preview` – preview the production build
+- `npm run lint` – lint the frontend
 
-## Expanding the Oxlint configuration
+## Setup
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+1. Copy `.env.example` to `.env` and add your Supabase project URL and publishable key:
+
+   ```env
+   VITE_SUPABASE_URL=https://your-project.supabase.co
+   VITE_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
+   ```
+
+   Never put a service-role key in `.env` — Vite exposes `VITE_*` values to the browser.
+
+2. Run `supabase/schema.sql` once in your Supabase Dashboard → SQL Editor → New query.
+   It creates every table, the role permission helpers, RLS policies and the
+   `get_workspace()` RPC. It inserts no users, projects or demo content.
+
+3. Install dependencies and start the app:
+
+   ```bash
+   npm install
+   npm run dev
+   ```
+
+4. The first account to sign up becomes the **owner**. Later signups are `viewer`
+   unless an owner/admin has invited their email with a specific role. Everyone picks
+   the role they use at login; a mismatch is rejected. Sessions persist across visits
+   via Supabase Auth.
+
+## Roles
+
+`owner`, `admin`, `manager`, `member`, `viewer`. The same permission matrix is mirrored
+in `frontend/src/auth.jsx` and `supabase/schema.sql` (`permissions_for` / `has_permission`).

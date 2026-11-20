@@ -25,8 +25,8 @@ Agency work involves many concurrent client projects, deliverables, and internal
 ## Capabilities and Constraints
 
 - Existing stack from `package.json`: React 19, Vite 8, Tailwind CSS 4, lucide-react icons. No framework decision needed.
-- Current implementation is a placeholder only: one Dashboard page with a sidebar (logo block, name "Mudasir", "Pro plan" label, search input). These strings are placeholder UI, not confirmed brand, user, or pricing facts.
-- Open decisions (not yet confirmed): product name and branding; exact feature set and roles; whether "Pro plan"/pricing is real; deployment target.
+- Confirmed branding: Acme Studio. Audience: internal team members signing in to a team collaboration workspace.
+- Content constraints: no demo labels, fake customers, fake metrics, pricing tables, or testimonials on the public landing and account pages.
 - The user stated high optimization and clean UI/UX as explicit quality expectations for the product.
 
 ## Evidence on Hand

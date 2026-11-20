@@ -1,56 +1,59 @@
-import { useState } from "react";
-import {
-  X, Users, Zap, Bell, ShieldCheck, Plug, Code2, CreditCard, Building2, Plus, Trash2,
-  Copy, Check, Key, Mail, GitBranch, Globe, Smartphone, Monitor, Globe2, CalendarDays,
-  MessageCircle, RefreshCw, ToggleLeft, ToggleRight, Crown, Lock
-} from "lucide-react";
+import { useMemo, useState } from "react";
+import { X, Users, Bell, ShieldCheck, Building2, Plus, Trash2, RefreshCw, Crown, Check } from "lucide-react";
+import { ROLES, ROLE_LABELS, useAuth } from "../auth";
 import { useStore } from "../store";
-import { uid } from "../data/seed";
-import { cx, initials, money } from "../utils";
+import { supabase } from "../supabase";
+import { savePreferences, saveSettings } from "../sync";
+import { cx, initials } from "../utils";
 
 const TABS = [
-  { id: "team", label: "Team", icon: Users },
-  { id: "automation", label: "Automation", icon: Zap },
-  { id: "notifications", label: "Notifications", icon: Bell },
-  { id: "security", label: "Security", icon: ShieldCheck },
-  { id: "integrations", label: "Integrations", icon: Plug },
-  { id: "api", label: "API", icon: Code2 },
-  { id: "billing", label: "Billing", icon: CreditCard },
-  { id: "org", label: "Organization", icon: Building2 },
+  { id: "team", label: "Team", icon: Users, permission: "team:read" },
+  { id: "workspace", label: "Workspace", icon: Building2, permission: "settings:write" },
+  { id: "notifications", label: "Notifications", icon: Bell, permission: "notifications:read" },
+  { id: "security", label: "Access", icon: ShieldCheck, permission: "team:read" },
 ];
 
-const ROLES = ["owner", "admin", "manager", "member", "guest"];
-
 export default function AdminDrawer({ onClose }) {
-  const { state, dispatch } = useStore();
-  const [tab, setTab] = useState("team");
-  const [integrations, setIntegrations] = useState({ Slack: true, GitHub: false, "Google Calendar": true, Figma: false });
-  const [copied, setCopied] = useState("");
+  const { state, reloadWorkspace } = useStore();
+  const { user, hasPermission } = useAuth();
+  const visibleTabs = useMemo(() => TABS.filter(tab => hasPermission(tab.permission)), [hasPermission]);
+  const [tab, setTab] = useState(visibleTabs[0]?.id || "team");
+  const [refreshing, setRefreshing] = useState(false);
 
-  function copy(text, key) {
-    navigator.clipboard?.writeText(text);
-    setCopied(key);
-    setTimeout(() => setCopied(""), 1400);
+  async function refresh() {
+    setRefreshing(true);
+    await reloadWorkspace();
+    setRefreshing(false);
   }
 
   return (
     <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}>
       <div className="modal admin-modal">
         <div className="admin-head">
-          <div className="row"><span className="admin-mark"><Building2 size={18} /></span><div><h2>Workspace admin</h2><div className="small">{state.settings.org} · {state.settings.plan}</div></div></div>
-          <button className="icon-btn" onClick={onClose}><X size={18} /></button>
+          <div className="row">
+            <span className="admin-mark"><Building2 size={18} /></span>
+            <div>
+              <h2>Workspace admin</h2>
+              <div className="small">{state.settings.org || "Workspace"} · {user.name} · {ROLE_LABELS[user.role] || user.role}</div>
+            </div>
+          </div>
+          <div className="row">
+            <button className="icon-btn" title="Refresh" onClick={refresh} disabled={refreshing}><RefreshCw size={16} className={refreshing ? "spin" : ""} /></button>
+            <button className="icon-btn" onClick={onClose}><X size={18} /></button>
+          </div>
         </div>
         <div className="admin-layout">
-          <nav className="admin-nav">{TABS.map(t => { const Icon = t.icon; return <button key={t.id} className={cx("admin-nav-item", tab === t.id && "active")} onClick={() => setTab(t.id)}><Icon size={15} /> {t.label}</button>; })}</nav>
+          <nav className="admin-nav">
+            {visibleTabs.map(t => {
+              const Icon = t.icon;
+              return <button key={t.id} className={cx("admin-nav-item", tab === t.id && "active")} onClick={() => setTab(t.id)}><Icon size={15} /> {t.label}</button>;
+            })}
+          </nav>
           <div className="admin-content">
             {tab === "team" && <TeamTab />}
-            {tab === "automation" && <AutomationTab />}
+            {tab === "workspace" && <WorkspaceTab />}
             {tab === "notifications" && <NotificationsTab />}
-            {tab === "security" && <SecurityTab copy={copy} copied={copied} />}
-            {tab === "integrations" && <IntegrationsTab integrations={integrations} setIntegrations={setIntegrations} />}
-            {tab === "api" && <ApiTab copy={copy} copied={copied} />}
-            {tab === "billing" && <BillingTab />}
-            {tab === "org" && <OrgTab />}
+            {tab === "security" && <AccessTab />}
           </div>
         </div>
       </div>
@@ -63,126 +66,178 @@ function AdminSection({ title, note, children, action }) {
 }
 
 function TeamTab() {
-  const { state, dispatch } = useStore();
-  return <AdminSection title="Team directory" note="Roles, capacity, leave and availability. Changes apply to this demo workspace.">
-    <div className="admin-team-list">
-      {state.members.map(m => (
-        <div key={m.id} className="admin-member">
-          <span className="avatar" style={{ background: m.color }}>{initials(m.name)}</span>
-          <div className="admin-member-name"><b>{m.name}</b><span className="small">{m.title}</span></div>
-          <div className="admin-member-meta"><span className="small">Capacity</span><b>{m.hours}/{m.capacity}h</b></div>
-          <label className="lbl compact-lbl">Leave<input className="field" style={{ width: 88, minHeight: 32, height: 32, padding: "4px 8px" }} value={m.leave || ""} placeholder="None" onChange={e => dispatch({ type: "UPDATE_MEMBER", member: { id: m.id, leave: e.target.value || null } })} /></label>
-          <select className="field role-select" value={m.role} onChange={e => dispatch({ type: "UPDATE_MEMBER", member: { id: m.id, role: e.target.value } })}>{ROLES.map(r => <option key={r}>{r}</option>)}</select>
-          <span className={cx("presence", m.status)}>{m.status}</span>
-        </div>
-      ))}
-    </div>
-    <div className="role-legend">{ROLES.map(r => <span key={r} className="chip">{r} · {r === "owner" ? "full control" : r === "admin" ? "manage all" : r === "manager" ? "manage projects" : r === "guest" ? "scoped access" : "standard access"}</span>)}</div>
-  </AdminSection>;
+  const { state, reloadWorkspace } = useStore();
+  const { user, hasPermission } = useAuth();
+  const canWrite = hasPermission("team:write");
+  const isOwner = user.role === "owner";
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [draft, setDraft] = useState({ name: "", email: "", password: "", role: "member", title: "" });
+  const [inviting, setInviting] = useState(false);
+
+  async function changeRole(member, role) {
+    setBusyId(member.id); setError(""); setNotice("");
+    try {
+      const { error: rpcError } = await supabase.rpc("set_member_role", { p_member: member.id, p_role: role });
+      if (rpcError) throw rpcError;
+      await reloadWorkspace();
+      setNotice(`${member.name} is now ${ROLE_LABELS[role] || role}.`);
+    } catch (e) { setError(e.message); } finally { setBusyId(""); }
+  }
+
+  async function removeMember(member) {
+    if (!window.confirm(`Remove ${member.name} from the workspace?`)) return;
+    setBusyId(member.id); setError(""); setNotice("");
+    try {
+      const { error: rpcError } = await supabase.rpc("remove_member", { p_member: member.id });
+      if (rpcError) throw rpcError;
+      await reloadWorkspace();
+      setNotice(`${member.name} was removed.`);
+    } catch (e) { setError(e.message); } finally { setBusyId(""); }
+  }
+
+  async function invite(event) {
+    event.preventDefault();
+    setInviting(true); setError(""); setNotice("");
+    try {
+      const { data, error: rpcError } = await supabase.rpc("invite_member", {
+        p_email: draft.email,
+        p_name: draft.name,
+        p_role: draft.role,
+        p_title: draft.title,
+      });
+      if (rpcError) throw rpcError;
+      setDraft({ name: "", email: "", password: "", role: "member", title: "" });
+      await reloadWorkspace();
+      setNotice(`${data?.email || "Teammate"} can now sign up with the role ${ROLE_LABELS[data?.role || draft.role] || data?.role || draft.role}.`);
+    } catch (e) { setError(e.message); } finally { setInviting(false); }
+  }
+
+  return (
+    <AdminSection title="Team directory" note="Every account and the role it signs in with.">
+      {error && <div className="glass-error" style={{ marginBottom: 10 }}>{error}</div>}
+      {notice && <div className="glass-note" style={{ marginBottom: 10 }}>{notice}</div>}
+      <div className="admin-team-list">
+        {state.members.map(m => (
+          <div key={m.id} className="admin-member">
+            <span className="avatar" style={{ background: m.color }}>{initials(m.name)}</span>
+            <div className="admin-member-name"><b>{m.name}{m.id === user.id ? " (you)" : ""}</b><span className="small">{m.email}</span></div>
+            {canWrite && m.role !== "owner" ? (
+              <select className="field role-select" value={m.role} disabled={busyId === m.id} onChange={e => changeRole(m, e.target.value)}>
+                {ROLES.filter(r => r.id !== "owner").map(r => <option key={r.id} value={r.id}>{r.label}</option>)}
+              </select>
+            ) : (
+              <span className="pill">{ROLE_LABELS[m.role] || m.role}</span>
+            )}
+            <span className={cx("presence", m.status)}>{m.status || "offline"}</span>
+            {isOwner && m.id !== user.id && (
+              <button className="icon-btn" title={`Remove ${m.name}`} disabled={busyId === m.id} onClick={() => removeMember(m)}><Trash2 size={14} /></button>
+            )}
+          </div>
+        ))}
+        {!state.members.length && <div className="empty">No teammates yet.</div>}
+      </div>
+      {canWrite && (
+        <form className="panel stack" onSubmit={invite} style={{ marginTop: 16, background: "var(--surface-2)" }}>
+          <div className="space-between"><b style={{ fontSize: 13 }}>Invite a teammate</b><span className="small">They sign up with this email and get the role you choose.</span></div>
+          <div className="grid-4">
+            <label className="lbl">Name<input className="field" value={draft.name} onChange={e => setDraft({ ...draft, name: e.target.value })} required /></label>
+            <label className="lbl">Email<input className="field" type="email" value={draft.email} onChange={e => setDraft({ ...draft, email: e.target.value })} required /></label>
+            <label className="lbl">Title<input className="field" value={draft.title} onChange={e => setDraft({ ...draft, title: e.target.value })} /></label>
+            <label className="lbl">Role<select className="field" value={draft.role} onChange={e => setDraft({ ...draft, role: e.target.value })}>{ROLES.filter(r => r.id !== "owner").map(r => <option key={r.id} value={r.id}>{r.label}</option>)}</select></label>
+          </div>
+          <div><button className="btn primary" type="submit" disabled={inviting}>{inviting ? "Adding…" : <><Plus size={15} /> Add teammate</>}</button></div>
+        </form>
+      )}
+      {!canWrite && <div className="small" style={{ marginTop: 12 }}>Only owners and admins can change roles or add people.</div>}
+    </AdminSection>
+  );
 }
 
-function AutomationTab() {
-  const { state, dispatch } = useStore();
-  const [draft, setDraft] = useState({ name: "", trigger: "Task created", condition: "Priority is High", action: "Notify assignee" });
-  const triggers = ["Task created", "Due date passed", "Checklist completed", "Status changed", "Comment added"];
-  const conditions = ["Priority is High", "All items checked", "Task not done", "Assignee is me", "Always"];
-  const actions = ["Notify assignee", "Set status Review", "Send in-app alert", "Add label Follow-up", "Create subtask"];
-  return <AdminSection title="Automation rules" note="Trigger → condition → action. Rules run locally in this demo." action={<span className="chip">{state.automations.filter(a => a.enabled).length} active</span>}>
-    <div className="automation-list">{state.automations.map(a => (
-      <div key={a.id} className={cx("automation-row", !a.enabled && "off")}>
-        <button className="icon-btn" onClick={() => dispatch({ type: "TOGGLE_AUTOMATION", id: a.id })}>{a.enabled ? <ToggleRight size={22} className="on-icon" /> : <ToggleLeft size={22} />}</button>
-        <div className="automation-flow"><b>{a.name}</b><div className="small"><span className="flow-chip">{a.trigger}</span><span className="flow-arrow">→</span><span className="flow-chip">{a.condition}</span><span className="flow-arrow">→</span><span className="flow-chip">{a.action}</span></div></div>
-        <button className="icon-btn" onClick={() => dispatch({ type: "TOGGLE_AUTOMATION", id: a.id })} title="Disable/enable"><Zap size={14} /></button>
+function WorkspaceTab() {
+  const { state, dispatch, reloadWorkspace } = useStore();
+  const [org, setOrg] = useState(state.settings.org || "Workspace");
+  const [plan, setPlan] = useState(state.settings.plan || "Local");
+  const [status, setStatus] = useState("idle");
+  const [error, setError] = useState("");
+
+  async function save(event) {
+    event.preventDefault();
+    setStatus("saving"); setError("");
+    try {
+      await saveSettings({ org, plan });
+      dispatch({ type: "UPDATE_SETTINGS", settings: { org, plan } });
+      await reloadWorkspace();
+      setStatus("saved");
+    } catch (e) { setError(e.message); setStatus("error"); }
+  }
+
+  return <AdminSection title="Organization settings" note="Workspace identity and plan label.">
+    <form className="stack" onSubmit={save}>
+      <div className="grid-2">
+        <label className="lbl">Organization name<input className="field" value={org} onChange={e => setOrg(e.target.value)} /></label>
+        <label className="lbl">Plan label<input className="field" value={plan} onChange={e => setPlan(e.target.value)} /></label>
       </div>
-    ))}</div>
-    <div className="automation-add">
-      <input className="field" value={draft.name} onChange={e => setDraft({ ...draft, name: e.target.value })} placeholder="Rule name" />
-      <select className="field" value={draft.trigger} onChange={e => setDraft({ ...draft, trigger: e.target.value })}>{triggers.map(x => <option key={x}>{x}</option>)}</select>
-      <select className="field" value={draft.condition} onChange={e => setDraft({ ...draft, condition: e.target.value })}>{conditions.map(x => <option key={x}>{x}</option>)}</select>
-      <select className="field" value={draft.action} onChange={e => setDraft({ ...draft, action: e.target.value })}>{actions.map(x => <option key={x}>{x}</option>)}</select>
-      <button className="btn primary sm" onClick={() => { if (!draft.name.trim()) return; dispatch({ type: "ADD_AUTOMATION", automation: { id: uid("a"), ...draft, name: draft.name.trim(), enabled: true } }); setDraft({ ...draft, name: "" }); }}><Plus size={14} /> Add rule</button>
+      {error && <div className="glass-error">{error}</div>}
+      <div className="row">
+        <button className="btn primary" type="submit" disabled={status === "saving"}>{status === "saving" ? "Saving…" : "Save settings"}</button>
+        {status === "saved" && <span className="small row"><Check size={14} /> Saved</span>}
+      </div>
+    </form>
+    <h4 style={{ margin: "18px 0 8px", fontSize: 13 }}>Audit log</h4>
+    <div className="list">
+      {state.audit.map(a => <div key={a.id} className="list-row"><div><b style={{ fontSize: 13 }}>{a.action}</b><div className="small">{a.actor}</div></div><span className="small">{typeof a.time === "string" ? a.time : new Date(a.time).toLocaleString()}</span></div>)}
+      {!state.audit.length && <div className="empty">No activity recorded yet.</div>}
     </div>
   </AdminSection>;
 }
 
 function NotificationsTab() {
   const { state, dispatch } = useStore();
+  const { user } = useAuth();
+  const [saving, setSaving] = useState("");
+  const [error, setError] = useState("");
   const labels = { inApp: "In-app notifications", email: "Email digests", push: "Push notifications", mentions: "@mentions", deadlines: "Deadline reminders" };
+
+  async function toggle(key, value) {
+    setSaving(key); setError("");
+    try {
+      await savePreferences(user.id, { ...state.notificationsPrefs, [key]: value });
+      dispatch({ type: "SET_PREFS", prefs: { [key]: value } });
+    } catch (e) { setError(e.message); } finally { setSaving(""); }
+  }
+
   return <AdminSection title="Notification preferences" note="Choose where and when the workspace reaches you.">
-    <div className="preference-list">{Object.entries(state.notificationsPrefs).map(([k, v]) => (
-      <label key={k} className="preference-row"><span>{labels[k] || k}</span><button className={cx("switch", v && "on")} onClick={() => dispatch({ type: "SET_PREFS", prefs: { [k]: !v } })}><span /></button></label>
-    ))}</div>
-    <div className="panel" style={{ marginTop: 14, background: "var(--surface-2)" }}><b style={{ fontSize: 13 }}>Recent activity</b><div className="list" style={{ marginTop: 8 }}>{state.notifications.map(n => <div key={n.id} className="list-row"><span>{n.text}</span><span className="small">{n.time}</span></div>)}</div></div>
-  </AdminSection>;
-}
-
-function SecurityTab({ copy, copied }) {
-  const { state, dispatch } = useStore();
-  const s = state.settings;
-  return <AdminSection title="Security & sessions" note="Sign-in methods, multi-factor authentication and active devices.">
-    <div className="security-grid">
-      <div className="security-card"><span className="security-icon"><Mail size={17} /></span><div><b>Email & password</b><div className="small">Primary sign-in method</div></div><span className="pill green">Enabled</span></div>
-      <div className="security-card"><span className="security-icon"><Globe size={17} /></span><div><b>Google OAuth</b><div className="small">Connect a Google account</div></div><span className="pill blue">Available</span></div>
-      <div className="security-card"><span className="security-icon"><GitBranch size={17} /></span><div><b>GitHub OAuth</b><div className="small">Connect a GitHub account</div></div><span className="pill blue">Available</span></div>
-      <div className="security-card"><span className="security-icon"><Lock size={17} /></span><div><b>Multi-factor authentication</b><div className="small">Require a second step at sign-in</div></div><button className={cx("switch", s.mfa && "on")} onClick={() => dispatch({ type: "UPDATE_SETTINGS", settings: { mfa: !s.mfa } })}><span /></button></div>
-      <div className="security-card"><span className="security-icon"><ShieldCheck size={17} /></span><div><b>Single sign-on (SSO)</b><div className="small">SAML for organization accounts</div></div><button className={cx("switch", s.sso && "on")} onClick={() => dispatch({ type: "UPDATE_SETTINGS", settings: { sso: !s.sso } })}><span /></button></div>
+    {error && <div className="glass-error" style={{ marginBottom: 10 }}>{error}</div>}
+    <div className="preference-list">
+      {Object.entries(state.notificationsPrefs).map(([key, value]) => (
+        <div key={key} className="preference-row">
+          <span>{labels[key] || key}</span>
+          <button type="button" className={cx("switch", value && "on")} disabled={saving === key} onClick={() => toggle(key, !value)}><span /></button>
+        </div>
+      ))}
     </div>
-    <h4 style={{ margin: "18px 0 8px", fontSize: 13 }}>Active sessions</h4>
-    <div className="list">{s.sessions.map(session => <div key={session.id} className="list-row"><div className="row">{session.device.includes("iPhone") ? <Smartphone size={16} /> : <Monitor size={16} />}<div><b style={{ fontSize: 13 }}>{session.device}</b><div className="small">Last active {session.last}</div></div></div><div className="row">{session.active && <span className="pill green">This device</span>}<button className="btn sm" onClick={() => dispatch({ type: "UPDATE_SETTINGS", settings: { sessions: s.sessions.filter(x => x.id !== session.id) } })}>Revoke</button></div></div>)}</div>
-    <div className="row" style={{ marginTop: 12 }}><button className="btn sm" onClick={() => copy("sk_demo_••••••••••••4f2a", "key")}>{copied === "key" ? <Check size={14} /> : <Copy size={14} />} Copy recovery code</button><button className="btn sm" onClick={() => dispatch({ type: "UPDATE_SETTINGS", settings: { sessions: [...s.sessions, { id: uid("s"), device: "New session · Chrome", active: false, last: "Just now" }] } })}><RefreshCw size={14} /> New session</button></div>
   </AdminSection>;
 }
 
-function IntegrationsTab({ integrations, setIntegrations }) {
-  const meta = {
-    Slack: { icon: MessageCircle, note: "Project updates and mentions in channels" },
-    GitHub: { icon: GitBranch, note: "Link commits and pull requests to tasks" },
-    "Google Calendar": { icon: CalendarDays, note: "Sync due dates to your calendar" },
-    Figma: { icon: Globe2, note: "Attach design files as previews" },
-  };
-  return <AdminSection title="Integrations" note="Connect the tools your team already uses. Demo toggles store locally.">
-    <div className="integration-grid">{Object.entries(meta).map(([name, m]) => { const Icon = m.icon; const on = integrations[name]; return (
-      <div key={name} className="integration-card"><span className="integration-icon"><Icon size={19} /></span><div><b>{name}</b><div className="small">{m.note}</div></div><button className={cx("btn sm", on ? "primary" : "")} onClick={() => setIntegrations(v => ({ ...v, [name]: !v[name] }))}>{on ? "Connected" : "Connect"}</button></div>
-    ); })}</div>
-  </AdminSection>;
-}
-
-function ApiTab({ copy, copied }) {
-  const [webhook, setWebhook] = useState("https://hooks.example.com/team-management");
-  const [events, setEvents] = useState(["task.created", "task.status_changed", "project.completed"]);
-  const allEvents = ["task.created", "task.status_changed", "task.assigned", "project.completed", "invoice.paid"];
-  return <AdminSection title="Public API & webhooks" note="Programmatic access and event delivery (demo credentials).">
-    <div className="api-block"><div className="space-between"><b style={{ fontSize: 13 }}>API key</b><span className="pill">Server-side only</span></div><div className="row" style={{ marginTop: 8 }}><code className="api-code">sk_demo_••••••••••••••••4f2a</code><button className="btn sm" onClick={() => copy("sk_demo_4f2a", "api")}>{copied === "api" ? <Check size={14} /> : <Copy size={14} />} Copy</button></div></div>
-    <div className="api-block"><b style={{ fontSize: 13 }}>Webhook endpoint</b><div className="row" style={{ marginTop: 8 }}><input className="field" value={webhook} onChange={e => setWebhook(e.target.value)} /><button className="btn sm primary">Save</button></div></div>
-    <div className="api-block"><b style={{ fontSize: 13 }}>Subscribed events</b><div className="row" style={{ flexWrap: "wrap", marginTop: 8 }}>{allEvents.map(e => <button key={e} className={cx("chip", events.includes(e) && "chip-on")} onClick={() => setEvents(v => v.includes(e) ? v.filter(x => x !== e) : [...v, e])}>{events.includes(e) && <Check size={12} />} {e}</button>)}</div></div>
-    <div className="row" style={{ marginTop: 12 }}><button className="btn sm"><Code2 size={14} /> View API docs</button><button className="btn sm"><RefreshCw size={14} /> Send test event</button></div>
-  </AdminSection>;
-}
-
-function BillingTab() {
+function AccessTab() {
   const { state } = useStore();
-  const seats = state.members.length;
-  const total = state.invoices.reduce((s, i) => s + i.amount, 0);
-  return <AdminSection title="Billing & subscription" note="Plan, seats and payment history for this workspace.">
-    <div className="billing-hero"><span className="billing-crown"><Crown size={20} /></span><div><b>{state.settings.plan}</b><div className="small">{seats} seats · billed monthly</div></div><button className="btn sm">Manage plan</button></div>
-    <div className="grid-3" style={{ marginTop: 14 }}>
-      <div className="kpi"><span>Monthly spend</span><b>{money(seats * 18)}</b><div className="small">${18} per seat</div></div>
-      <div className="kpi"><span>Invoiced</span><b>{money(total)}</b><div className="small">{state.invoices.length} invoices</div></div>
-      <div className="kpi"><span>Next renewal</span><b>Nov 30</b><div className="small">Auto-renew on</div></div>
+  const { user } = useAuth();
+  return <AdminSection title="Roles and access" note="What each role can open and change in this workspace.">
+    <div className="security-grid">
+      {ROLES.map(role => (
+        <div key={role.id} className={cx("security-card", role.id === user.role && "is-current")}>
+          <span className="security-icon">{role.id === "owner" ? <Crown size={17} /> : <ShieldCheck size={17} />}</span>
+          <div><b>{role.label}{role.id === user.role ? " · you" : ""}</b><div className="small">{role.note}</div></div>
+        </div>
+      ))}
     </div>
-    <div className="list" style={{ marginTop: 14 }}>{state.invoices.slice(0, 4).map(i => <div key={i.id} className="list-row"><div><b>{i.id}</b><div className="small">{i.client} · {i.issued}</div></div><div className="row"><b>{money(i.amount)}</b><span className={cx("pill", i.status === "Paid" ? "green" : i.status === "Overdue" ? "red" : "blue")}>{i.status}</span></div></div>)}</div>
-  </AdminSection>;
-}
-
-function OrgTab() {
-  const { state, dispatch } = useStore();
-  return <AdminSection title="Organization settings" note="Workspace identity, defaults and audit trail.">
-    <div className="grid-2">
-      <label className="lbl">Organization name<input className="field" value={state.settings.org} onChange={e => dispatch({ type: "UPDATE_SETTINGS", settings: { org: e.target.value } })} /></label>
-      <label className="lbl">Plan label<input className="field" value={state.settings.plan} onChange={e => dispatch({ type: "UPDATE_SETTINGS", settings: { plan: e.target.value } })} /></label>
+    <h4 style={{ margin: "18px 0 8px", fontSize: 13 }}>Current sessions</h4>
+    <div className="panel" style={{ background: "var(--surface-2)" }}>
+      <div className="space-between"><span className="small">Your session is managed by Supabase Auth and stays signed in across visits on this device.</span><span className="pill green">Active</span></div>
+      <div className="small" style={{ marginTop: 6 }}>Signed in as {user.name} · {user.email || "no email on file"}</div>
     </div>
-    <div className="row" style={{ marginTop: 12 }}><button className="btn sm"><Key size={14} /> Rotate workspace key</button><button className="btn sm danger"><Trash2 size={14} /> Archive workspace</button></div>
-    <h4 style={{ margin: "18px 0 8px", fontSize: 13 }}>Audit log</h4>
-    <div className="list">{state.audit.slice(0, 8).map(a => <div key={a.id} className="list-row"><div><b style={{ fontSize: 13 }}>{a.action}</b><div className="small">{a.actor}</div></div><span className="small">{a.time}</span></div>)}</div>
+    <div className="small" style={{ marginTop: 12 }}>{state.members.length} account{state.members.length === 1 ? "" : "s"} in this workspace.</div>
   </AdminSection>;
 }

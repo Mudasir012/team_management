@@ -1,5 +1,6 @@
 ﻿import { useState } from "react";
 import { ArrowRight, ArrowUpRight, Check, CheckCheck, ChevronRight, Clock3, AlertTriangle, Eye } from "lucide-react";
+import { useAuth } from "../auth";
 import { useStore } from "../store";
 import { daysRemaining, fmtDate, money } from "../utils";
 
@@ -13,7 +14,9 @@ const longDate = now.toLocaleDateString("en-US", { weekday: "long", month: "long
 
 export default function DashboardPage() {
   const { state, dispatch } = useStore();
+  const { user, hasPermission } = useAuth();
   const [taskFilter, setTaskFilter] = useState("all");
+  const firstName = user?.name?.split(" ")[0] || "there";
 
   const allTasks = state.projects.flatMap(p => p.tasks.map(t => ({ ...t, projectName: p.name, projectId: p.id })));
   const openTasks = allTasks.filter(t => t.status !== "done");
@@ -26,7 +29,7 @@ export default function DashboardPage() {
     state.members.reduce((s, m) => s + m.hours, 0) / Math.max(1, state.members.reduce((s, m) => s + m.capacity, 0)) * 100
   );
 
-  const myOpen = openTasks.filter(t => t.assignees?.includes("u1"));
+  const myOpen = openTasks.filter(t => user?.id && t.assignees?.includes(user.id));
   const filteredMyTasks = myOpen
     .filter(t => taskFilter === "all" || (taskFilter === "today" && daysRemaining(t.due) <= 0) || (taskFilter === "overdue" && daysRemaining(t.due) < 0))
     .sort((a, b) => daysRemaining(a.due) - daysRemaining(b.due) || (priorityRank[a.priority] ?? 3) - (priorityRank[b.priority] ?? 3));
@@ -77,7 +80,7 @@ export default function DashboardPage() {
       <section className="dash-brief">
         <div className="dash-brief-copy">
           <div className="dash-brief-eyebrow">{longDate}</div>
-          <h2>{greeting}, Maya</h2>
+          <h2>{greeting}, {firstName}</h2>
           <p>
             You have {plural(dueToday.length, "task")} due today, {plural(overdue.length, "task")} overdue
             {awaitingReview.length ? `, and ${plural(awaitingReview.length, "review")} waiting` : ""}
@@ -91,8 +94,8 @@ export default function DashboardPage() {
             <span>{money(state.invoices.filter(i => i.status === "Paid").reduce((s, i) => s + i.amount, 0))} collected</span>
           </div>
           <div className="dash-brief-actions">
-            <button className="btn primary" onClick={() => goTo("todo")}>Open my tasks <ArrowRight size={15} /></button>
-            <button className="btn ghost" onClick={() => goTo("earning")}>View invoices</button>
+            {hasPermission("tasks:read") && <button className="btn primary" onClick={() => goTo("todo")}>Open my tasks <ArrowRight size={15} /></button>}
+            {hasPermission("invoices:read") && <button className="btn ghost" onClick={() => goTo("earning")}>View invoices</button>}
           </div>
         </div>
         <div className="dash-signal-grid">

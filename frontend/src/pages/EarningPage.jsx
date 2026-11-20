@@ -1,7 +1,6 @@
 ﻿import { useState } from "react";
 import { useStore } from "../store";
 import { money, fmtDate } from "../utils";
-import { uid } from "../data/seed";
 
 export default function EarningPage() {
   const { state, dispatch } = useStore();

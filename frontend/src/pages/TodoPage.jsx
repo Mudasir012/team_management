@@ -1,8 +1,7 @@
 import { useMemo, useState } from "react";
 import { CheckCircle2, Clock, AlertTriangle, Circle, UserRoundX, Timer, Plus, Sparkles, ArrowUpRight } from "lucide-react";
 import { useStore } from "../store";
-import { uid } from "../data/seed";
-import { cx, fmtDate, daysRemaining } from "../utils";
+import { cx, fmtDate, daysRemaining, uid } from "../utils";
 import {
   useTaskFilters, applyTaskFilters, TaskToolbar, TaskList, TaskBoard, TaskCalendar,
   TaskTimeline, TaskWorkload, AddTaskModal, TaskDetailModal, statusesFor
