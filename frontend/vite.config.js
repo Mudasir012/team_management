@@ -10,7 +10,9 @@ export default defineConfig({
   envDir: fileURLToPath(new URL('..', import.meta.url)),
   plugins: [react(), tailwindcss()],
   build: {
-    outDir: 'dist',
+    // Emit to the repository root so hosts like Vercel find a top-level `dist`
+    // with or without an explicit outputDirectory override.
+    outDir: '../dist',
     emptyOutDir: true,
   },
 })
