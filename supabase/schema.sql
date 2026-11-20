@@ -550,6 +550,7 @@ declare
   v_invite public.workspace_invites%rowtype;
   v_first boolean;
   v_avatar text;
+  v_project_id uuid;
 begin
   select count(*) = 0 into v_first from public.profiles;
   v_name := coalesce(nullif(new.raw_user_meta_data->>'name', ''), split_part(coalesce(new.email, ''), '@', 1));
@@ -560,7 +561,10 @@ begin
   else
     select * into v_invite
     from public.workspace_invites
-    where email = lower(coalesce(new.email, '')) and accepted_at is null
+    where
+      email = lower(coalesce(new.email, ''))
+      and accepted_at is null
+      and (expires_at is null or expires_at > now())
     order by created_at desc
     limit 1;
 
@@ -583,6 +587,15 @@ begin
 
   insert into public.profiles (id, name, email, role, title, avatar)
   values (new.id, v_name, lower(coalesce(new.email, '')), v_role, v_title, v_avatar);
+
+  -- Apply any project memberships that came with the accepted invite.
+  if v_invite.id is not null then
+    foreach v_project_id in array coalesce(v_invite.project_ids, '{}'::uuid[]) loop
+      insert into public.project_members (project_id, user_id, role, added_by)
+      values (v_project_id, new.id, v_invite.project_role, v_invite.invited_by)
+      on conflict (project_id, user_id) do nothing;
+    end loop;
+  end if;
 
   return new;
 end;
@@ -679,7 +692,169 @@ as $$
   insert into public.audit_log (user_id, action) values (auth.uid(), p_action);
 $$;
 
-create or replace function public.invite_member(p_email text, p_name text default '', p_role text default 'member', p_title text default '')
+-- ---------------------------------------------------------------------------
+-- Notification triggers
+-- ---------------------------------------------------------------------------
+create or replace function public.notify_user(p_user uuid, p_text text)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if p_user is null or p_user = auth.uid() then return; end if;
+  if exists (select 1 from public.profiles where id = p_user and not disabled) then
+    insert into public.notifications (user_id, text) values (p_user, p_text);
+  end if;
+end;
+$$;
+
+create or replace function public.trg_project_member_notify()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_project_name text;
+  v_project_id uuid;
+begin
+  if TG_OP = 'INSERT' then
+    v_project_id := NEW.project_id;
+  else
+    v_project_id := OLD.project_id;
+  end if;
+
+  select name into v_project_name
+  from public.projects
+  where id = v_project_id;
+
+  if TG_OP = 'INSERT' then
+    perform public.notify_user(
+      NEW.user_id,
+      'You were added to ' || coalesce(v_project_name, 'a project') || ' as ' || NEW.role
+    );
+  elsif TG_OP = 'UPDATE' and NEW.role is distinct from OLD.role then
+    perform public.notify_user(
+      NEW.user_id,
+      'Your role in ' || coalesce(v_project_name, 'a project') || ' changed to ' || NEW.role
+    );
+  end if;
+  return null;
+end;
+$$;
+
+drop trigger if exists project_members_notify on public.project_members;
+create trigger project_members_notify
+after insert or update of role on public.project_members
+for each row execute function public.trg_project_member_notify();
+
+create or replace function public.trg_task_assigned_notify()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_title text;
+  v_project_name text;
+begin
+  select t.title, p.name into v_title, v_project_name
+  from public.tasks t
+  join public.projects p on p.id = t.project_id
+  where t.id = NEW.task_id;
+
+  perform public.notify_user(
+    NEW.user_id,
+    'You were assigned to ' || coalesce(v_title, 'a task') ||
+    case when v_project_name is null then '' else ' in ' || v_project_name end
+  );
+  return null;
+end;
+$$;
+
+drop trigger if exists task_assignees_notify on public.task_assignees;
+create trigger task_assignees_notify
+after insert on public.task_assignees
+for each row execute function public.trg_task_assigned_notify();
+
+-- Task comments live in task_comments (created later in this script). This
+-- trigger function is created now and wired to its table in the child-table
+-- section; it notifies the task creator, assignees, and any @mentioned profile.
+create or replace function public.trg_task_comment_notify()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_title text;
+  v_author_name text;
+  v_recipient uuid;
+begin
+  select title into v_title from public.tasks where id = NEW.task_id;
+  select coalesce(name, 'Someone') into v_author_name
+  from public.profiles where id = NEW.author_id;
+  v_author_name := coalesce(v_author_name, 'Someone');
+
+  for v_recipient in
+    select distinct p.id
+    from public.profiles p
+    where
+      p.id <> coalesce(NEW.author_id, '00000000-0000-0000-0000-000000000000'::uuid)
+      and not p.disabled
+      and (
+        p.id = (select created_by from public.tasks where id = NEW.task_id)
+        or exists (
+          select 1 from public.task_assignees ta
+          where ta.task_id = NEW.task_id and ta.user_id = p.id
+        )
+        or NEW.body ~* ('@' || p.id::text)
+        or (coalesce(p.name, '') <> '' and lower(NEW.body) like '%@' || lower(p.name) || '%')
+        or (coalesce(p.name, '') <> '' and lower(NEW.body) like '%@' || lower(split_part(p.name, ' ', 1)) || '%')
+      )
+  loop
+    perform public.notify_user(
+      v_recipient,
+      v_author_name || ' commented on ' || coalesce(v_title, 'a task')
+    );
+  end loop;
+  return null;
+end;
+$$;
+
+create or replace function public.trg_workspace_role_notify()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if NEW.role is distinct from OLD.role then
+    perform public.notify_user(NEW.id, 'Your workspace role changed to ' || NEW.role);
+  end if;
+  return null;
+end;
+$$;
+
+drop trigger if exists profiles_role_notify on public.profiles;
+create trigger profiles_role_notify
+after update of role on public.profiles
+for each row execute function public.trg_workspace_role_notify();
+
+-- The old four-argument signature is replaced by the extended one below. New
+-- callers can still pass just email/name/role/title thanks to the defaults.
+drop function if exists public.invite_member(text, text, text, text);
+
+create or replace function public.invite_member(
+  p_email text,
+  p_name text default '',
+  p_role text default 'member',
+  p_title text default '',
+  p_project_ids uuid[] default '{}'::uuid[],
+  p_project_role public.project_role default 'contributor',
+  p_expires_at timestamptz default null
+)
 returns jsonb
 language plpgsql
 security definer
@@ -689,6 +864,7 @@ declare
   v_email text := lower(trim(p_email));
   v_role text := coalesce(nullif(trim(p_role), ''), 'member');
   v_existing public.profiles%rowtype;
+  v_project_id uuid;
 begin
   if not public.has_permission('team:write') then
     raise exception 'Only owners and admins can invite teammates';
@@ -699,6 +875,17 @@ begin
   if v_role not in ('admin', 'manager', 'member', 'viewer') then
     raise exception 'Choose a valid role';
   end if;
+  if p_expires_at is not null and p_expires_at <= now() then
+    raise exception 'Invite expiry must be in the future';
+  end if;
+
+  -- Caller must be allowed to add people to every requested project.
+  foreach v_project_id in array coalesce(p_project_ids, '{}'::uuid[]) loop
+    if not public.can_manage_project_members(v_project_id)
+       or not public.can_assign_project_role(v_project_id, p_project_role) then
+      raise exception 'You cannot add people to one of these projects';
+    end if;
+  end loop;
 
   select * into v_existing from public.profiles where email = v_email;
   if found then
@@ -709,19 +896,31 @@ begin
           name = coalesce(nullif(p_name, ''), v_existing.name),
           title = p_title
       where id = v_existing.id;
+      foreach v_project_id in array coalesce(p_project_ids, '{}'::uuid[]) loop
+        insert into public.project_members (project_id, user_id, role, added_by)
+        values (v_project_id, v_existing.id, p_project_role, auth.uid())
+        on conflict (project_id, user_id)
+        do update set role = excluded.role, added_by = excluded.added_by;
+      end loop;
       perform public.log_audit('re-activated ' || v_existing.email);
       return jsonb_build_object('email', v_existing.email, 'role', v_role, 'reactivated', true);
     end if;
     raise exception 'That email already has an account';
   end if;
 
-  insert into public.workspace_invites (email, name, title, role, invited_by)
-  values (v_email, coalesce(p_name, ''), coalesce(p_title, ''), v_role, auth.uid())
+  insert into public.workspace_invites (email, name, title, role, invited_by, project_ids, project_role, expires_at)
+  values (
+    v_email, coalesce(p_name, ''), coalesce(p_title, ''), v_role, auth.uid(),
+    coalesce(p_project_ids, '{}'::uuid[]), p_project_role, p_expires_at
+  )
   on conflict (email) do update
     set name = excluded.name,
         title = excluded.title,
         role = excluded.role,
         invited_by = excluded.invited_by,
+        project_ids = excluded.project_ids,
+        project_role = excluded.project_role,
+        expires_at = excluded.expires_at,
         accepted_at = null;
 
   perform public.log_audit('invited ' || v_email || ' as ' || v_role);
@@ -783,9 +982,172 @@ begin
   where id = p_member;
 
   delete from public.project_members where user_id = p_member;
+  delete from public.team_members where user_id = p_member;
   delete from public.task_assignees where user_id = p_member;
   perform public.log_audit('removed ' || v_target.name);
   return jsonb_build_object('id', p_member, 'removed', true);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Project membership + team RPCs (SECURITY DEFINER, audit logged)
+-- ---------------------------------------------------------------------------
+create or replace function public.add_project_member(
+  p_project uuid,
+  p_user uuid,
+  p_role public.project_role default 'contributor'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_project_name text;
+  v_user_name text;
+begin
+  if not public.can_manage_project_members(p_project)
+     or not public.can_assign_project_role(p_project, p_role) then
+    raise exception 'You cannot add people with that project role';
+  end if;
+
+  select name into v_project_name from public.projects where id = p_project;
+  if not found then raise exception 'Project not found'; end if;
+  select name into v_user_name from public.profiles where id = p_user and not disabled;
+  if not found then raise exception 'Member not found or access disabled'; end if;
+
+  insert into public.project_members (project_id, user_id, role, added_by)
+  values (p_project, p_user, p_role, auth.uid())
+  on conflict (project_id, user_id)
+  do update set role = excluded.role, added_by = excluded.added_by;
+
+  perform public.log_audit('added ' || v_user_name || ' to ' || v_project_name || ' as ' || p_role);
+  return jsonb_build_object('projectId', p_project, 'userId', p_user, 'role', p_role);
+end;
+$$;
+
+create or replace function public.set_project_member_role(
+  p_project uuid,
+  p_user uuid,
+  p_role public.project_role
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_project_name text;
+  v_user_name text;
+begin
+  if not public.can_manage_project_members(p_project)
+     or not public.can_assign_project_role(p_project, p_role) then
+    raise exception 'You cannot assign that project role';
+  end if;
+
+  select name into v_project_name from public.projects where id = p_project;
+  if not found then raise exception 'Project not found'; end if;
+  select name into v_user_name from public.profiles where id = p_user and not disabled;
+  if not found then raise exception 'Member not found or access disabled'; end if;
+
+  if not exists (
+    select 1 from public.project_members where project_id = p_project and user_id = p_user
+  ) then
+    raise exception 'That person is not a member of this project';
+  end if;
+
+  update public.project_members
+  set role = p_role
+  where project_id = p_project and user_id = p_user;
+
+  perform public.log_audit('changed ' || v_user_name || ' role in ' || v_project_name || ' to ' || p_role);
+  return jsonb_build_object('projectId', p_project, 'userId', p_user, 'role', p_role);
+end;
+$$;
+
+create or replace function public.remove_project_member(p_project uuid, p_user uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_project_name text;
+  v_user_name text;
+  v_role public.project_role;
+  v_leads integer;
+begin
+  if not public.can_manage_project_members(p_project) then
+    raise exception 'You cannot manage this project’s members';
+  end if;
+
+  select name into v_project_name from public.projects where id = p_project;
+  if not found then raise exception 'Project not found'; end if;
+  select name into v_user_name from public.profiles where id = p_user;
+  if not found then raise exception 'Member not found'; end if;
+
+  select role into v_role
+  from public.project_members
+  where project_id = p_project and user_id = p_user;
+  if not found then raise exception 'That person is not a member of this project'; end if;
+
+  if v_role = 'lead' then
+    select count(*) into v_leads
+    from public.project_members
+    where project_id = p_project and role = 'lead';
+    if v_leads <= 1 then
+      raise exception 'A project must keep at least one lead';
+    end if;
+  end if;
+
+  delete from public.project_members
+  where project_id = p_project and user_id = p_user;
+
+  -- Removing a project membership also drops task assignments in that project.
+  delete from public.task_assignees ta
+  using public.tasks t
+  where ta.task_id = t.id and t.project_id = p_project and ta.user_id = p_user;
+
+  perform public.log_audit('removed ' || v_user_name || ' from ' || v_project_name);
+  return jsonb_build_object('projectId', p_project, 'userId', p_user, 'removed', true);
+end;
+$$;
+
+create or replace function public.add_team_to_project(
+  p_project uuid,
+  p_team uuid,
+  p_role public.project_role default 'contributor'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_project_name text;
+  v_team_name text;
+  v_added integer;
+begin
+  if not public.can_manage_project_members(p_project)
+     or not public.can_assign_project_role(p_project, p_role) then
+    raise exception 'You cannot add that team with that project role';
+  end if;
+
+  select name into v_project_name from public.projects where id = p_project;
+  if not found then raise exception 'Project not found'; end if;
+  select name into v_team_name from public.teams where id = p_team;
+  if not found then raise exception 'Team not found'; end if;
+
+  insert into public.project_members (project_id, user_id, role, added_by)
+  select p_project, tm.user_id, p_role, auth.uid()
+  from public.team_members tm
+  join public.profiles p on p.id = tm.user_id and not p.disabled
+  on conflict (project_id, user_id)
+  do update set role = excluded.role, added_by = excluded.added_by;
+  get diagnostics v_added = row_count;
+
+  perform public.log_audit('added team ' || v_team_name || ' to ' || v_project_name || ' as ' || p_role);
+  return jsonb_build_object('projectId', p_project, 'teamId', p_team, 'role', p_role, 'added', v_added);
 end;
 $$;
 
@@ -1360,24 +1722,60 @@ create policy time_entries_delete on public.time_entries
 for delete to authenticated using (user_id = auth.uid());
 
 -- ---------------------------------------------------------------------------
+-- Realtime publication. Guarded so the script also runs on plain Postgres.
+-- ---------------------------------------------------------------------------
+do $$
+declare
+  v_table text;
+begin
+  if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    foreach v_table in array array['chat_messages', 'tasks', 'notifications', 'project_members'] loop
+      if not exists (
+        select 1 from pg_publication_tables
+        where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = v_table
+      ) then
+        execute format('alter publication supabase_realtime add table public.%I', v_table);
+      end if;
+    end loop;
+  end if;
+end $$;
+
+-- Keep old row values in UPDATE/DELETE events for tasks and project members.
+alter table public.tasks replica identity full;
+alter table public.project_members replica identity full;
+
+-- ---------------------------------------------------------------------------
 -- Grants
 -- ---------------------------------------------------------------------------
 revoke all on all tables in schema public from anon;
 grant select, insert, update, delete on all tables in schema public to authenticated;
 
 revoke execute on function public.get_workspace() from public, anon;
-revoke execute on function public.invite_member(text, text, text, text) from public, anon;
+revoke execute on function public.invite_member(text, text, text, text, uuid[], public.project_role, timestamptz) from public, anon;
 revoke execute on function public.set_member_role(uuid, text) from public, anon;
 revoke execute on function public.remove_member(uuid) from public, anon;
+revoke execute on function public.add_project_member(uuid, uuid, public.project_role) from public, anon;
+revoke execute on function public.set_project_member_role(uuid, uuid, public.project_role) from public, anon;
+revoke execute on function public.remove_project_member(uuid, uuid) from public, anon;
+revoke execute on function public.add_team_to_project(uuid, uuid, public.project_role) from public, anon;
 revoke execute on function public.log_audit(text) from public, anon;
+revoke execute on function public.notify_user(uuid, text) from public, anon, authenticated;
 revoke execute on function public.handle_new_user() from public, anon, authenticated;
 revoke execute on function public.protect_profile() from public, anon, authenticated;
+revoke execute on function public.trg_project_member_notify() from public, anon, authenticated;
+revoke execute on function public.trg_task_assigned_notify() from public, anon, authenticated;
+revoke execute on function public.trg_task_comment_notify() from public, anon, authenticated;
+revoke execute on function public.trg_workspace_role_notify() from public, anon, authenticated;
 
 grant execute on function public.workspace_status() to anon, authenticated;
 grant execute on function public.get_workspace() to authenticated;
-grant execute on function public.invite_member(text, text, text, text) to authenticated;
+grant execute on function public.invite_member(text, text, text, text, uuid[], public.project_role, timestamptz) to authenticated;
 grant execute on function public.set_member_role(uuid, text) to authenticated;
 grant execute on function public.remove_member(uuid) to authenticated;
+grant execute on function public.add_project_member(uuid, uuid, public.project_role) to authenticated;
+grant execute on function public.set_project_member_role(uuid, uuid, public.project_role) to authenticated;
+grant execute on function public.remove_project_member(uuid, uuid) to authenticated;
+grant execute on function public.add_team_to_project(uuid, uuid, public.project_role) to authenticated;
 grant execute on function public.log_audit(text) to authenticated;
 
 -- Keep the workspace label empty by default; no demo rows.
