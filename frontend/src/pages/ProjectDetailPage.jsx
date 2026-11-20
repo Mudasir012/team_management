@@ -1,12 +1,16 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft, Pencil, Trash2, Download, Circle, CalendarDays, Users, FileText, MessageSquare,
   Paperclip, Activity as ActivityIcon, Settings as SettingsIcon, Plus, X, Send, Layers, Flag,
-  ChevronRight, Upload, File as FileIcon, Timer, TrendingUp, Check, List
+  ChevronRight, Upload, File as FileIcon, Timer, TrendingUp, Check, List, UserPlus, Mail,
+  Search, RefreshCw, ShieldCheck
 } from "lucide-react";
+import { useAuth } from "../auth";
 import { useStore } from "../store";
-import { uid } from "../data/seed";
-import { cx, money, fmtDate, fmtLong, daysLabel, daysRemaining, initials, progressFromTasks } from "../utils";
+import {
+  addProjectMember, addTeamToProject, inviteToProject, removeProjectMember, setProjectMemberRole
+} from "../sync";
+import { cx, money, fmtDate, fmtLong, daysLabel, daysRemaining, initials, progressFromTasks, uid } from "../utils";
 import { AvatarStack, StatusBadge } from "../components/ui";
 import { ProjectModal } from "../components/Overlays";
 import {
@@ -17,6 +21,13 @@ import {
 const TODAY_DATE = new Date().toISOString().slice(0, 10);
 const SOON_DATE = new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10);
 
+const PROJECT_ROLES = [
+  { id: "lead", label: "Lead", note: "Manages the project and its members." },
+  { id: "contributor", label: "Contributor", note: "Creates and edits project work." },
+  { id: "viewer", label: "Viewer", note: "Can read everything in the project." },
+  { id: "client", label: "Client", note: "External, read-only access." },
+];
+
 const TABS = [
   { id: "overview", label: "Overview", icon: Layers },
   { id: "tasks", label: "Tasks", icon: List },
@@ -24,6 +35,7 @@ const TABS = [
   { id: "calendar", label: "Calendar", icon: CalendarDays },
   { id: "timeline", label: "Timeline", icon: TrendingUp },
   { id: "workload", label: "Workload", icon: Users },
+  { id: "members", label: "Members", icon: UserPlus },
   { id: "sprints", label: "Sprints", icon: Flag },
   { id: "docs", label: "Docs", icon: FileText },
   { id: "chat", label: "Chat", icon: MessageSquare },
@@ -35,8 +47,12 @@ const TABS = [
 
 function ColumnsIcon(props) { return <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" {...props}><rect x="3" y="4" width="5" height="16" rx="1" /><rect x="9.5" y="4" width="5" height="11" rx="1" /><rect x="16" y="4" width="5" height="14" rx="1" /></svg>; }
 
-export default function ProjectDetailPage({ project, onClose }) {
+export default function ProjectDetailPage({ project, onClose, initialTaskId, onTaskClose }) {
   const { state, dispatch } = useStore();
+  const { user, hasPermission } = useAuth();
+  const isWorkspaceAdmin = ["owner", "admin"].includes(user?.role);
+  const canManageMembers = hasPermission("team:read") &&
+    (isWorkspaceAdmin || project.memberRoles?.[user?.id] === "lead");
   const [tab, setTab] = useState("overview");
   const [editOpen, setEditOpen] = useState(false);
   const { filters, setFilters, set, reset } = useTaskFilters();
@@ -44,6 +60,14 @@ export default function ProjectDetailPage({ project, onClose }) {
   const [selected, setSelected] = useState([]);
   const [addOpen, setAddOpen] = useState(false);
   const [detailTask, setDetailTask] = useState(null);
+
+  // /tasks/:id deep links resolve to the containing project in App, then open
+  // the task here once the workspace payload has loaded.
+  useEffect(() => {
+    if (!initialTaskId) return;
+    const task = (project.tasks || []).find(t => t.id === initialTaskId);
+    if (task) setDetailTask(task);
+  }, [initialTaskId, project.tasks]);
 
   const patch = (changes) => dispatch({ type: "UPSERT_PROJECT", project: { ...project, ...changes } });
   const visible = useMemo(() => applyTaskFilters(project.tasks, filters), [project.tasks, filters]);
@@ -67,7 +91,14 @@ export default function ProjectDetailPage({ project, onClose }) {
     });
     setSelected([]);
   }
-  function openTask(t) { setDetailTask(project.tasks.find(x => x.id === t.id) || t); }
+  function openTask(t) {
+    setDetailTask(project.tasks.find(x => x.id === t.id) || t);
+    dispatch({ type: "SET_SELECTED_TASK", id: t.id });
+  }
+  function closeTask() {
+    setDetailTask(null);
+    onTaskClose?.();
+  }
   function selectTab(id) {
     setTab(id);
     if (["board", "calendar", "timeline", "workload", "list"].includes(id)) setView(id);
@@ -146,25 +177,326 @@ export default function ProjectDetailPage({ project, onClose }) {
         {tab === "files" && <FilesTab project={project} patch={patch} />}
         {tab === "activity" && <ActivityTab project={project} />}
         {tab === "time" && <TimeTab project={project} />}
+        {tab === "members" && <MembersTab project={project} canManage={canManageMembers} />}
         {tab === "settings" && <SettingsTab project={project} patch={patch} onClose={onClose} />}
       </div>
 
       {editOpen && <ProjectModal existing={project} onClose={() => setEditOpen(false)} />}
       {addOpen && <AddTaskModal onClose={() => setAddOpen(false)} projects={[project]} defaultProjectId={project.id} />}
-      {detailTask && <TaskDetailModal task={detailTask} project={project} projects={state.projects} onClose={() => setDetailTask(null)} />}
+      {detailTask && <TaskDetailModal key={detailTask.id} task={detailTask} project={project} projects={state.projects} onClose={closeTask} />}
+    </div>
+  );
+}
+
+function MembersTab({ project, canManage }) {
+  const { state, reloadWorkspace } = useStore();
+  const { user } = useAuth();
+  const [addOpen, setAddOpen] = useState(false);
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const roles = project.memberRoles || {};
+  const members = (project.members || [])
+    .map(id => state.members.find(m => m.id === id))
+    .filter(Boolean);
+  const invites = (state.workspaceInvites || []).filter(invite =>
+    (invite.projectIds || []).includes(project.id)
+  );
+
+  async function runAction(label, task) {
+    setBusyId(label); setError(""); setNotice("");
+    try {
+      await task();
+      await reloadWorkspace();
+      setNotice("Membership updated.");
+    } catch (e) {
+      setError(e.message || e);
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function changeRole(member, role) {
+    await runAction(member.id, () => setProjectMemberRole(project.id, member.id, role));
+  }
+
+  async function remove(member) {
+    if (!window.confirm(`Remove ${member.name} from ${project.name}?`)) return;
+    await runAction(member.id, () => removeProjectMember(project.id, member.id));
+  }
+
+  return (
+    <div className="members-view">
+      <section className="panel pd-panel">
+        <div className="space-between" style={{ marginBottom: 14 }}>
+          <div>
+            <h3>Project members</h3>
+            <div className="small">
+              {project.visibility === "private" ? "Private project" : "Workspace project"} ·
+              {" "}{members.length} member{members.length === 1 ? "" : "s"} ·
+              {" "}{canManage ? "You can manage this list." : "Only leads and workspace admins can change it."}
+            </div>
+          </div>
+          {canManage && <button className="btn sm primary" onClick={() => setAddOpen(true)}><UserPlus size={14} /> Add people</button>}
+        </div>
+        {error && <div className="glass-error" style={{ marginBottom: 10 }}>{error}</div>}
+        {notice && <div className="glass-note" style={{ marginBottom: 10 }}>{notice}</div>}
+        <div className="member-list">
+          {members.map(member => {
+            const role = roles[member.id] || "contributor";
+            const isSelf = member.id === user?.id;
+            return (
+              <div key={member.id} className="member-row">
+                <span className="avatar" style={{ background: member.color }}>{initials(member.name)}</span>
+                <div className="member-info">
+                  <b>{member.name}{isSelf ? " (you)" : ""}</b>
+                  <span className="small">{member.email || member.title || member.role}</span>
+                </div>
+                <span className="pill">{member.role}</span>
+                {canManage && !isSelf ? (
+                  <div className="row">
+                    <select
+                      className="field role-select"
+                      value={role}
+                      disabled={busyId === member.id}
+                      onChange={e => changeRole(member, e.target.value)}
+                      aria-label={`Project role for ${member.name}`}
+                    >
+                      {PROJECT_ROLES.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
+                    </select>
+                    <button className="icon-btn" title={`Remove ${member.name}`} disabled={busyId === member.id} onClick={() => remove(member)}><Trash2 size={14} /></button>
+                  </div>
+                ) : (
+                  <span className="chip">{PROJECT_ROLES.find(item => item.id === role)?.label || role}</span>
+                )}
+              </div>
+            );
+          })}
+          {!members.length && <div className="empty">No one has been added to this project yet.</div>}
+        </div>
+      </section>
+
+      <section className="panel pd-panel" style={{ marginTop: 16 }}>
+        <div className="space-between"><h3>Pending project invites</h3><span className="chip">{invites.length}</span></div>
+        <div className="small" style={{ margin: "6px 0 12px" }}>These emails will be added with the selected project role as soon as they accept.</div>
+        <div className="member-list">
+          {invites.map(invite => (
+            <div key={invite.id} className="member-row">
+              <span className="avatar" style={{ background: "var(--surface-3)" }}><Mail size={15} /></span>
+              <div className="member-info">
+                <b>{invite.name || invite.email}</b>
+                <span className="small">{invite.email}</span>
+              </div>
+              <span className="chip">{PROJECT_ROLES.find(item => item.id === invite.projectRole)?.label || invite.projectRole}</span>
+              <span className="pill warn">Pending</span>
+            </div>
+          ))}
+          {!invites.length && <div className="empty">No pending invites for this project.</div>}
+        </div>
+      </section>
+
+      {canManage && state.teams.length > 0 && (
+        <div className="glass-note row" style={{ marginTop: 12, gap: 8 }}>
+          <ShieldCheck size={15} />
+          <span className="small">{state.teams.length} team{state.teams.length === 1 ? "" : "s"} available. Add a whole team from the Add people dialog.</span>
+        </div>
+      )}
+      {addOpen && <AddPeopleModal project={project} onClose={() => setAddOpen(false)} onChanged={reloadWorkspace} />}
+    </div>
+  );
+}
+
+function AddPeopleModal({ project, onClose, onChanged }) {
+  const { state } = useStore();
+  const [mode, setMode] = useState("people");
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState({});
+  const [teamId, setTeamId] = useState(state.teams[0]?.id || "");
+  const [teamRole, setTeamRole] = useState("contributor");
+  const [invite, setInvite] = useState({ email: "", name: "", workspaceRole: "member", projectRole: "contributor", expiresAt: "" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const existing = new Set(project.members || []);
+  const candidates = state.members.filter(member => {
+    if (existing.has(member.id)) return false;
+    const q = query.trim().toLowerCase();
+    return !q || member.name?.toLowerCase().includes(q) || member.email?.toLowerCase().includes(q);
+  });
+  const selectedIds = Object.keys(selected);
+
+  async function finish(task, successMessage) {
+    setBusy(true); setError(""); setNotice("");
+    try {
+      await task();
+      await onChanged?.();
+      setNotice(successMessage);
+    } catch (e) {
+      setError(e.message || e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function addSelected() {
+    if (!selectedIds.length) return;
+    finish(async () => {
+      for (const userId of selectedIds) {
+        await addProjectMember(project.id, userId, selected[userId]);
+      }
+    }, `Added ${selectedIds.length} person${selectedIds.length === 1 ? "" : "s"} to the project.`);
+  }
+
+  function addTeam() {
+    if (!teamId) return;
+    finish(() => addTeamToProject(project.id, teamId, teamRole), "Team added to the project.");
+  }
+
+  function sendInvite() {
+    if (!invite.email.trim()) return;
+    const expiresAt = invite.expiresAt
+      ? new Date(`${invite.expiresAt}T23:59:59Z`).toISOString()
+      : null;
+    finish(() => inviteToProject({
+      email: invite.email.trim(),
+      name: invite.name.trim(),
+      role: invite.workspaceRole,
+      title: "",
+      projectIds: [project.id],
+      projectRole: invite.projectRole,
+      expiresAt,
+    }), `Invite sent to ${invite.email.trim()}.`);
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal add-people-modal" role="dialog" aria-modal="true" aria-label="Add people to project">
+        <div className="task-modal-head">
+          <div><h2>Add people</h2><span className="small">Choose how to bring people into {project.name}.</span></div>
+          <button className="icon-btn" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="add-people-tabs" role="tablist">
+          <button className={cx("tab", mode === "people" && "active")} onClick={() => setMode("people")}><Users size={14} /> Workspace people</button>
+          <button className={cx("tab", mode === "team" && "active")} onClick={() => setMode("team")}><UserPlus size={14} /> Team</button>
+          <button className={cx("tab", mode === "invite" && "active")} onClick={() => setMode("invite")}><Mail size={14} /> Invite by email</button>
+        </div>
+        <div className="add-people-body">
+          {error && <div className="glass-error">{error}</div>}
+          {notice && <div className="glass-note">{notice}</div>}
+
+          {mode === "people" && (
+            <div className="stack">
+              <label className="field search-field">
+                <Search size={15} />
+                <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search name or email…" aria-label="Search workspace people" />
+              </label>
+              <div className="people-picker">
+                {candidates.map(member => (
+                  <div key={member.id} className="person-option">
+                    <button
+                      type="button"
+                      className={cx("person-main", selected[member.id] && "on")}
+                      onClick={() => setSelected(prev => {
+                        const next = { ...prev };
+                        if (next[member.id]) delete next[member.id];
+                        else next[member.id] = "contributor";
+                        return next;
+                      })}
+                    >
+                      <span className="avatar mini" style={{ background: member.color }}>{initials(member.name)}</span>
+                      <span><b>{member.name}</b><small className="small">{member.email || member.title}</small></span>
+                    </button>
+                    {selected[member.id] && (
+                      <select
+                        className="field role-select"
+                        value={selected[member.id]}
+                        aria-label={`Project role for ${member.name}`}
+                        onChange={e => setSelected(prev => ({ ...prev, [member.id]: e.target.value }))}
+                      >
+                        {PROJECT_ROLES.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
+                      </select>
+                    )}
+                  </div>
+                ))}
+                {!candidates.length && <div className="empty">No matching people. Try an email invite instead.</div>}
+              </div>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <span className="small">{selectedIds.length} selected</span>
+                <button className="btn primary" disabled={busy || !selectedIds.length} onClick={addSelected}>
+                  {busy ? "Adding…" : <><UserPlus size={14} /> Add selected</>}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {mode === "team" && (
+            <div className="stack">
+              {state.teams.length ? (
+                <>
+                  <label className="lbl">Team
+                    <select className="field" value={teamId} onChange={e => setTeamId(e.target.value)}>
+                      {state.teams.map(team => <option key={team.id} value={team.id}>{team.name} · {team.members?.length || 0} people</option>)}
+                    </select>
+                  </label>
+                  <label className="lbl">Project role
+                    <select className="field" value={teamRole} onChange={e => setTeamRole(e.target.value)}>
+                      {PROJECT_ROLES.map(item => <option key={item.id} value={item.id}>{item.label} — {item.note}</option>)}
+                    </select>
+                  </label>
+                  <div className="row" style={{ justifyContent: "flex-end" }}>
+                    <button className="btn primary" disabled={busy || !teamId} onClick={addTeam}>
+                      {busy ? "Adding…" : <><RefreshCw size={14} /> Add team</>}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="empty">No teams have been created yet. Add people individually or by email.</div>
+              )}
+            </div>
+          )}
+
+          {mode === "invite" && (
+            <form className="stack" onSubmit={e => { e.preventDefault(); sendInvite(); }}>
+              <div className="grid-2">
+                <label className="lbl">Name<input className="field" value={invite.name} onChange={e => setInvite({ ...invite, name: e.target.value })} placeholder="Optional" /></label>
+                <label className="lbl">Email<input className="field" type="email" required value={invite.email} onChange={e => setInvite({ ...invite, email: e.target.value })} placeholder="person@company.com" /></label>
+              </div>
+              <div className="grid-2">
+                <label className="lbl">Workspace role
+                  <select className="field" value={invite.workspaceRole} onChange={e => setInvite({ ...invite, workspaceRole: e.target.value })}>
+                    <option value="admin">Admin</option><option value="manager">Manager</option>
+                    <option value="member">Member</option><option value="viewer">Viewer</option>
+                  </select>
+                </label>
+                <label className="lbl">Project role
+                  <select className="field" value={invite.projectRole} onChange={e => setInvite({ ...invite, projectRole: e.target.value })}>
+                    {PROJECT_ROLES.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
+                  </select>
+                </label>
+              </div>
+              <label className="lbl">Invite expires (optional)<input className="field" type="date" value={invite.expiresAt} onChange={e => setInvite({ ...invite, expiresAt: e.target.value })} /></label>
+              <div className="row" style={{ justifyContent: "flex-end" }}>
+                <button className="btn primary" type="submit" disabled={busy}>{busy ? "Sending…" : <><Send size={14} /> Send invite</>}</button>
+              </div>
+            </form>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
 
 function OverviewTab({ project, patch, spent, progress, onOpenTask, setTab }) {
   const { state, dispatch } = useStore();
+  const { user } = useAuth();
   const [chatText, setChatText] = useState("");
   const upcoming = [...project.tasks].filter(t => t.status !== "done").sort((a, b) => new Date(a.due) - new Date(b.due)).slice(0, 5);
   const health = daysRemaining(project.end) < 0 ? "At risk" : progress >= 75 ? "On track" : "Needs focus";
 
   function sendChat(e) {
     e.preventDefault(); if (!chatText.trim()) return;
-    dispatch({ type: "ADD_CHAT", projectId: project.id, author: "u1", authorName: "Maya Chen", text: chatText.trim(), time: "Just now" });
+    dispatch({ type: "ADD_CHAT", projectId: project.id, author: user.id, authorName: user.name, text: chatText.trim(), time: "Just now" });
     setChatText("");
   }
 
@@ -294,13 +626,14 @@ function DocsTab({ project, patch }) {
 
 function ChatTab({ project }) {
   const { state, dispatch } = useStore();
+  const { user } = useAuth();
   const [text, setText] = useState("");
   const messages = project.chat || [];
-  function send(e) { e.preventDefault(); if (!text.trim()) return; dispatch({ type: "ADD_CHAT", projectId: project.id, author: "u1", authorName: "Maya Chen", text: text.trim(), time: new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }) }); setText(""); }
+  function send(e) { e.preventDefault(); if (!text.trim()) return; dispatch({ type: "ADD_CHAT", projectId: project.id, author: user.id, authorName: user.name, text: text.trim(), time: new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }) }); setText(""); }
   return (
     <div className="chat-view">
       <div className="chat-channel-head"><span className="channel-hash">#</span><div><h3>project-chat</h3><span className="small">Project discussion · {messages.length} messages · {project.members.length} members</span></div><span className="chip"><span className="online-dot" /> {project.members.length} online</span></div>
-      <div className="chat-messages">{messages.map(c => { const m = state.members.find(x => x.id === c.author); const mine = c.author === "u1"; return <div key={c.id} className={cx("chat-msg", mine && "mine")}><span className="avatar mini" style={{ background: m?.color || "#94a3b8" }}>{initials(m?.name || "U")}</span><div className="chat-bubble"><div className="space-between"><b>{m?.name || "Unknown"}</b><span className="small">{c.time}</span></div><p>{c.text}</p></div></div>; })}{!messages.length && <div className="empty">No messages yet. Start the conversation.</div>}</div>
+      <div className="chat-messages">{messages.map(c => { const m = state.members.find(x => x.id === c.author); const mine = c.author === user.id; return <div key={c.id} className={cx("chat-msg", mine && "mine")}><span className="avatar mini" style={{ background: m?.color || "#94a3b8" }}>{initials(m?.name || "U")}</span><div className="chat-bubble"><div className="space-between"><b>{m?.name || "Unknown"}</b><span className="small">{c.time}</span></div><p>{c.text}</p></div></div>; })}{!messages.length && <div className="empty">No messages yet. Start the conversation.</div>}</div>
       <form className="chat-composer" onSubmit={send}><input className="field" value={text} onChange={e => setText(e.target.value)} placeholder="Message #project-chat… use @ to mention" /><button className="btn primary" type="submit"><Send size={15} /> Send</button></form>
     </div>
   );
@@ -308,14 +641,15 @@ function ChatTab({ project }) {
 
 function FilesTab({ project, patch }) {
   const { state } = useStore();
+  const { user } = useAuth();
   const files = project.files || [];
   function upload(e) {
-    const additions = [...e.target.files].map(f => ({ id: uid("f"), name: f.name, size: `${(f.size / 1024 / 1024).toFixed(1)} MB`, owner: "u1", type: f.type, url: f.type.startsWith("image/") ? URL.createObjectURL(f) : null }));
+    const additions = [...e.target.files].map(f => ({ id: uid("f"), name: f.name, size: `${(f.size / 1024 / 1024).toFixed(1)} MB`, owner: user.id, type: f.type, url: f.type.startsWith("image/") ? URL.createObjectURL(f) : null }));
     patch({ files: [...files, ...additions] }); e.target.value = "";
   }
   return (
     <div className="files-view">
-      <div className="space-between"><div><h3>Project files</h3><span className="small">Uploads live in this browser session (demo).</span></div><label className="btn primary"><Upload size={15} /> Upload files<input type="file" multiple hidden onChange={upload} /></label></div>
+      <div className="space-between"><div><h3>Project files</h3><span className="small">Uploads live in this browser session.</span></div><label className="btn primary"><Upload size={15} /> Upload files<input type="file" multiple hidden onChange={upload} /></label></div>
       <div className="file-grid">{files.map(f => { const owner = state.members.find(m => m.id === f.owner); return (
         <div key={f.id} className="file-card"><div className="file-preview">{f.url ? <img src={f.url} alt={f.name} /> : <FileIcon size={28} />}</div><div><b>{f.name}</b><div className="small">{f.size} · {owner?.name || "Team"}</div></div><button className="icon-btn" onClick={() => patch({ files: files.filter(x => x.id !== f.id) })}><Trash2 size={14} /></button></div>
       ); })}{!files.length && <div className="empty">No files yet. Upload a brief, asset or document.</div>}</div>
@@ -342,7 +676,8 @@ function ActivityTab({ project }) {
 
 function TimeTab({ project }) {
   const { state, dispatch } = useStore();
-  const [draft, setDraft] = useState({ member: "u1", task: project.tasks[0]?.title || "", hours: 1, date: TODAY_DATE });
+  const { user } = useAuth();
+  const [draft, setDraft] = useState({ member: user.id, task: project.tasks[0]?.title || "", hours: 1, date: TODAY_DATE });
   const entries = state.timeEntries.filter(e => e.project === project.id);
   const total = entries.reduce((s, e) => s + Number(e.hours), 0);
   function add(e) { e.preventDefault(); dispatch({ type: "ADD_TIME_ENTRY", entry: { id: uid("te"), ...draft, project: project.id, hours: Number(draft.hours) } }); }
@@ -394,7 +729,7 @@ function SettingsTab({ project, patch, onClose }) {
 
       <section className="panel pd-panel" style={{ marginTop: 16 }}><h3>Task template</h3><div className="row"><select className="field" style={{ maxWidth: 280 }} value={template} onChange={e => setTemplate(e.target.value)}><option value="">Choose a template…</option><option>Design deliverable</option><option>Development task</option><option>Content piece</option><option>Campaign launch</option></select><button className="btn sm" onClick={() => { if (!template) return; const titles = { "Design deliverable": ["Brief & requirements", "Explore directions", "Internal review", "Final handoff"], "Development task": ["Scope", "Implement", "Test", "Deploy"], "Content piece": ["Outline", "Draft", "Edit", "Publish"], "Campaign launch": ["Assets", "Schedule", "QA", "Launch"] }; const added = (titles[template] || []).map(title => ({ ...{ id: uid("t"), projectId: project.id, status: "todo", priority: "Medium", labels: [], assignees: [], due: new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10), subtasks: [], checklist: [], attachments: [], comments: [], dependencies: [], recurring: null, estimate: 4, spent: 0, description: "", sprint: project.sprint }, title })); patch({ tasks: [...project.tasks, ...added] }); setTemplate(""); }}><Plus size={14} /> Create tasks</button></div><div className="small" style={{ marginTop: 8 }}>Templates seed a checklist of tasks into this project.</div></section>
 
-      <section className="panel pd-panel danger-zone" style={{ marginTop: 16 }}><h3>Danger zone</h3><div className="space-between"><div><b>Delete this project</b><div className="small">Removes all tasks, docs, chat and files in this demo workspace.</div></div><button className="btn danger" onClick={() => { if (window.confirm(`Delete ${project.name}?`)) { dispatch({ type: "DELETE_PROJECT", id: project.id }); onClose(); } }}><Trash2 size={14} /> Delete project</button></div></section>
+      <section className="panel pd-panel danger-zone" style={{ marginTop: 16 }}><h3>Danger zone</h3><div className="space-between"><div><b>Delete this project</b><div className="small">Removes all tasks, docs, chat, and files from this workspace.</div></div><button className="btn danger" onClick={() => { if (window.confirm(`Delete ${project.name}?`)) { dispatch({ type: "DELETE_PROJECT", id: project.id }); onClose(); } }}><Trash2 size={14} /> Delete project</button></div></section>
       <div className="small" style={{ marginTop: 8 }}>Members: {project.members.map(id => state.members.find(m => m.id === id)?.name).filter(Boolean).join(", ") || "None"}</div>
     </div>
   );
