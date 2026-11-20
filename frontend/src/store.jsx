@@ -7,8 +7,41 @@ import * as sync from "./sync";
 const StoreContext = createContext(null);
 
 const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
-const initialPage = params.get("page") || "home";
-const initialProjectId = params.get("project") || null;
+
+const PATH_PAGES = {
+  "/": "home",
+  "/login": "login",
+  "/signup": "login",
+  "/dashboard": "dashboard",
+  "/analytics": "analytics",
+  "/customers": "customer",
+  "/tasks": "todo",
+  "/projects": "project",
+  "/leads": "leads",
+  "/earnings": "earning",
+  "/expenses": "expenses",
+};
+
+function initialRoute() {
+  const path = (typeof window !== "undefined" ? window.location.pathname : "/").replace(/\/+$/, "") || "/";
+  const projectMatch = path.match(/^\/projects\/([^/]+)$/);
+  if (projectMatch) {
+    return { page: "projectDetail", projectId: decodeURIComponent(projectMatch[1]), taskId: null };
+  }
+  const taskMatch = path.match(/^\/tasks\/([^/]+)$/);
+  if (taskMatch) {
+    return { page: "projectDetail", projectId: null, taskId: decodeURIComponent(taskMatch[1]) };
+  }
+  return {
+    page: PATH_PAGES[path] || params.get("page") || "home",
+    projectId: params.get("project") || null,
+    taskId: null,
+  };
+}
+
+const route = initialRoute();
+const initialPage = route.page;
+const initialProjectId = route.projectId;
 
 const emptySettings = { org: "Workspace", plan: "Local", sso: false, mfa: false, sessions: [] };
 const emptyPrefs = { inApp: true, email: true, push: false, mentions: true, deadlines: true };
@@ -18,6 +51,8 @@ const initialState = {
   page: initialPage,
   projects: [],
   members: [],
+  teams: [],
+  workspaceInvites: [],
   labels: [],
   customers: [],
   leads: [],
@@ -27,6 +62,7 @@ const initialState = {
   notifications: [],
   audit: [],
   selectedProjectId: initialPage === "projectDetail" ? initialProjectId : null,
+  selectedTaskId: route.taskId,
   labelFilter: null,
   search: "",
   savedViews: [],
@@ -47,6 +83,8 @@ function emptyWorkspace(state) {
     ...state,
     projects: [],
     members: [],
+    teams: [],
+    workspaceInvites: [],
     labels: [],
     customers: [],
     leads: [],
@@ -55,6 +93,8 @@ function emptyWorkspace(state) {
     goals: [],
     notifications: [],
     audit: [],
+    selectedProjectId: null,
+    selectedTaskId: null,
     savedViews: [],
     automations: [],
     settings: emptySettings,
@@ -74,6 +114,7 @@ function reducer(state, action) {
     case "SET_SEARCH": return { ...state, search: action.search };
     case "SET_LABEL_FILTER": return { ...state, labelFilter: action.labelId, page: "project" };
     case "SELECT_PROJECT": return { ...state, selectedProjectId: action.id };
+    case "SET_SELECTED_TASK": return { ...state, selectedTaskId: action.id };
     case "SET_CURRENT_USER": return { ...state, currentUser: action.user };
     case "LOAD_WORKSPACE": {
       const payload = action.payload || {};
@@ -81,6 +122,8 @@ function reducer(state, action) {
         ...state,
         projects: payload.projects || [],
         members: payload.members || [],
+        teams: payload.teams || [],
+        workspaceInvites: payload.workspaceInvites || [],
         labels: payload.labels || [],
         customers: payload.customers || [],
         leads: payload.leads || [],
@@ -110,6 +153,17 @@ function reducer(state, action) {
     case "UPSERT_TASK": {
       const projects = state.projects.map(p => p.id === action.projectId ? { ...p, tasks: (p.tasks || []).some(t => t.id === action.task.id) ? p.tasks.map(t => t.id === action.task.id ? action.task : t) : [...(p.tasks || []), action.task] } : p);
       return { ...state, projects };
+    }
+    case "APPLY_TASK_RESULT": {
+      const saved = action.task;
+      if (!saved?.id) return state;
+      return {
+        ...state,
+        projects: state.projects.map(p => p.id === saved.projectId ? {
+          ...p,
+          tasks: (p.tasks || []).map(t => t.id === saved.id ? { ...t, ...saved } : t),
+        } : p),
+      };
     }
     case "DELETE_TASK": {
       const projects = state.projects.map(p => p.id === action.projectId ? { ...p, tasks: (p.tasks || []).filter(t => t.id !== action.taskId) } : p);
@@ -195,7 +249,11 @@ function syncJobFor(action, next, userId) {
     case "UPSERT_TASK": return { label: "task", task: () => sync.saveTask(action.task, action.projectId) };
     case "DELETE_TASK": return { label: "task deletion", task: () => sync.deleteTask(action.taskId) };
     case "SET_TASK_STATUS":
-    case "MOVE_TASK": return { label: "task status", task: () => sync.setTaskStatus(action.taskId, action.status) };
+    case "MOVE_TASK": {
+      const task = next.projects.flatMap(p => p.tasks || []).find(t => t.id === action.taskId);
+      if (!task) return null;
+      return { label: "task status", task: () => sync.setTaskStatus(task, action.status) };
+    }
     case "UPDATE_MEMBER": return { label: "member", task: () => sync.updateMember(action.member) };
     case "ADD_LABEL":
     case "UPDATE_LABEL": return { label: "label", task: () => sync.saveLabel(action.label) };
@@ -238,26 +296,30 @@ export function StoreProvider({ children }) {
   const [state, realDispatch] = useReducer(reducer, initialState);
   const stateRef = useRef(initialState);
   const queueRef = useRef(Promise.resolve());
+  const reloadRef = useRef(null);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [syncError, setSyncError] = useState("");
 
-  const enqueue = useCallback((label, task) => {
+  const enqueue = useCallback((label, task, onSuccess, onError) => {
     queueRef.current = queueRef.current
       .catch(() => {})
       .then(async () => {
         try {
-          await task();
+          const result = await task();
           setSyncError("");
+          onSuccess?.(result);
         } catch (error) {
           console.warn(`[sync] Could not save ${label}`, error);
           setSyncError(`Could not save ${label}: ${error?.message || error}`);
+          onError?.(error);
         }
       });
     return queueRef.current;
   }, []);
 
   const dispatch = useCallback((action) => {
-    const next = reducer(stateRef.current, action);
+    const previous = stateRef.current;
+    const next = reducer(previous, action);
     stateRef.current = next;
     realDispatch(action);
 
@@ -265,7 +327,25 @@ export function StoreProvider({ children }) {
     const activeUserId = user?.id;
     if (!activeUserId) return;
     const job = syncJobFor(action, next, activeUserId);
-    if (job) enqueue(job.label, job.task);
+    if (!job) return;
+
+    enqueue(
+      job.label,
+      job.task,
+      result => {
+        if (!result?.id) return;
+        const actionResult = { type: "APPLY_TASK_RESULT", task: result };
+        stateRef.current = reducer(stateRef.current, actionResult);
+        realDispatch(actionResult);
+      },
+      () => {
+        // Undo the optimistic change, then reconcile with the server so a
+        // queued follow-up edit does not leave a stale snapshot in place.
+        stateRef.current = previous;
+        realDispatch({ type: "RESTORE_STATE", state: previous });
+        reloadRef.current?.();
+      }
+    );
   }, [enqueue, user?.id]);
 
   const applyPayload = useCallback((payload) => {
@@ -300,6 +380,10 @@ export function StoreProvider({ children }) {
   }, [user, applyPayload, setWorkspacePermissionsUser]);
 
   useEffect(() => {
+    reloadRef.current = reloadWorkspace;
+  }, [reloadWorkspace]);
+
+  useEffect(() => {
     if (loading) return;
     if (!user) {
       setWorkspacePermissionsUser(null);
@@ -317,6 +401,28 @@ export function StoreProvider({ children }) {
     root.classList.toggle("dark", state.theme === "dark");
     root.dataset.theme = state.theme;
   }, [state.theme]);
+
+  // Realtime keeps shared changes visible without a manual refresh. Several
+  // events can arrive together, so reloads are coalesced into one RPC.
+  useEffect(() => {
+    if (!user || !supabaseConfigured || !supabase) return undefined;
+    let timer = null;
+    const channel = supabase.channel(`workspace-${user.id}`);
+    for (const table of ["chat_messages", "tasks", "notifications", "project_members"]) {
+      channel.on("postgres_changes", { event: "*", schema: "public", table }, () => {
+        if (timer) window.clearTimeout(timer);
+        timer = window.setTimeout(() => {
+          timer = null;
+          reloadWorkspace();
+        }, 250);
+      });
+    }
+    channel.subscribe();
+    return () => {
+      if (timer) window.clearTimeout(timer);
+      supabase.removeChannel(channel);
+    };
+  }, [user?.id, reloadWorkspace]);
 
   const clearSyncError = useCallback(() => setSyncError(""), []);
 
