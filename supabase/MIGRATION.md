@@ -33,6 +33,8 @@ run the whole script again in the Supabase SQL Editor at any time.
   in a project where they are a `lead`/`contributor` member.
 - `project_members` writes require `can_manage_project_members()` plus a role the
   caller is allowed to assign.
+- An `after insert` trigger enrols the project creator as `lead`, so a manager can
+  keep editing a project they just created.
 - New `teams` / `team_members` policies require `team:read` / `team:write`.
 
 ### 4. RPCs, triggers, notifications and realtime

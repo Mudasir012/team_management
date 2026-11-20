@@ -743,6 +743,33 @@ create trigger on_auth_user_created
 after insert on auth.users
 for each row execute function public.handle_new_user();
 
+-- A manager may create a project, but scoped write policies only admit project
+-- leads/contributors. Make the creator a lead immediately so their new project
+-- remains editable (and visible when switched to private).
+create or replace function public.trg_project_creator_membership()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if NEW.created_by is not null
+     and not exists (
+       select 1 from public.project_members
+       where project_id = NEW.id and user_id = NEW.created_by
+     ) then
+    insert into public.project_members (project_id, user_id, role, added_by)
+    values (NEW.id, NEW.created_by, 'lead', NEW.created_by);
+  end if;
+  return null;
+end;
+$$;
+
+drop trigger if exists projects_creator_membership on public.projects;
+create trigger projects_creator_membership
+after insert on public.projects
+for each row execute function public.trg_project_creator_membership();
+
 create or replace function public.protect_profile()
 returns trigger
 language plpgsql

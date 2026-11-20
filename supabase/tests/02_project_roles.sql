@@ -1,7 +1,7 @@
 -- pgTAP: project visibility and the project-role permission matrix.
 begin;
 
-select plan(13);
+select plan(14);
 
 alter table public.profiles disable trigger profiles_protect;
 
@@ -71,6 +71,22 @@ reset role;
 perform pg_temp.as_user('30000000-0000-0000-0000-000000000003');
 select ok(public.can_write_project('30000000-0000-0000-0000-000000000010'), 'contributor manager can write their project');
 reset role;
+
+-- A non-admin creator is enrolled as project lead so scoped writes work.
+perform pg_temp.as_user('30000000-0000-0000-0000-000000000005');
+insert into public.projects (id, name, visibility, created_by) values
+  ('30000000-0000-0000-0000-000000000012', 'Manager Created Project', 'private', '30000000-0000-0000-0000-000000000005')
+on conflict (id) do nothing;
+reset role;
+select ok(
+  exists (
+    select 1 from public.project_members
+    where project_id = '30000000-0000-0000-0000-000000000012'
+      and user_id = '30000000-0000-0000-0000-000000000005'
+      and role = 'lead'
+  ),
+  'project creator becomes the project lead'
+);
 
 -- Membership matrix --------------------------------------------------------
 perform pg_temp.as_user('30000000-0000-0000-0000-000000000002');
