@@ -66,6 +66,25 @@ The script ends with `notify pgrst, 'reload schema';`. A first run on a fresh
 project needs no extra steps. Re-running is safe: all DDL is guarded, and the data
 backfill uses `on conflict do nothing`.
 
+## Tests
+
+pgTAP suites live in `supabase/tests/`:
+
+- `01_roles_tables.sql` checks every workspace role against every table.
+- `02_project_roles.sql` checks private-project visibility and the project-role
+  matrix (lead/contributor/viewer/client, plus owner/admin).
+- `03_task_upsert.sql` checks the `updated_at` conflict guard, normalized task
+  children, comment notifications and the project-member assignment trigger.
+
+Run them against a local/migration-tested database with the Supabase CLI:
+
+```bash
+supabase db test
+```
+
+Each file opens and rolls back its own transaction, so it can also be pasted
+into a pgTAP-enabled SQL Editor.
+
 ## Application-side follow-up
 
 After running the SQL, deploy the frontend in the same release. The frontend now:
